@@ -11,6 +11,24 @@ else()
 endif()
 message(STATUS "Building for ${BOARD_NAME} (PICO_BOARD=${PICO_BOARD})")
 
+# Console CLI sur UART0 (GP0/GP1) EN PLUS de l'USB.
+#
+# Le pilote stdio du SDK multiplexe les deux : rien a changer dans uart_cli.c,
+# la CLI repond simplement sur les deux liens. Sert a faire passer la console
+# par un pont USB-UART externe (le FaultyCat expose un uart_passthrough sur
+# CH0/CH1 -> CDC3).
+#
+# ATTENTION -- exclusion mutuelle materielle : UART0 GP0/GP1 est la liaison
+# ChipSHOUTER. Quand cette option est active, chipshot_uart_{init,process}()
+# ne sont PAS appeles et la commande CS refuse explicitement de s'executer :
+# les deux ne peuvent pas posseder le meme peripherique.
+#
+# OFF par defaut : le binaire pico2 par defaut ne change pas.
+option(RAIDEN_CONSOLE_UART "CLI aussi sur UART0 GP0/GP1 (exclut le ChipSHOUTER)" OFF)
+if(RAIDEN_CONSOLE_UART)
+    message(STATUS "Console UART0 GP0/GP1 ACTIVE -- ChipSHOUTER desactive")
+endif()
+
 # Pull in SDK (must be before project)
 include($ENV{PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 
@@ -66,9 +84,16 @@ target_link_libraries(raiden_pico
     hardware_dma
 )
 
-# Enable USB-only serial output (no UART stdio)
+# Sortie serie : USB toujours, UART0 seulement sur demande (voir l'option en
+# tete de fichier). pico_enable_stdio_uart(1) utilise PICO_DEFAULT_UART, qui
+# est uart0 sur GP0/GP1 pour la Pico 2 -- exactement les broches ChipSHOUTER.
 pico_enable_stdio_usb(raiden_pico 1)
-pico_enable_stdio_uart(raiden_pico 0)
+if(RAIDEN_CONSOLE_UART)
+    pico_enable_stdio_uart(raiden_pico 1)
+    target_compile_definitions(raiden_pico PRIVATE RAIDEN_CONSOLE_UART=1)
+else()
+    pico_enable_stdio_uart(raiden_pico 0)
+endif()
 
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(raiden_pico)

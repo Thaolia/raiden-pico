@@ -15,6 +15,16 @@ def _glitch_count(raiden):
     return int(m.group(1))
 
 
+def _console_owns_uart0(raiden):
+    """True when the firmware was built with -DRAIDEN_CONSOLE_UART=ON.
+
+    UART0/GP0/GP1 then carries the CLI console instead of the ChipSHOUTER, and
+    every CS command answers with an explicit unavailability error rather than
+    its usual argument validation. VERSION is the only way to tell from here.
+    """
+    return "ChipSHOUTER disabled" in raiden.cmd("VERSION")
+
+
 def _is_armed(resp):
     """ARM query prints 'ARMED' or 'DISARMED' — careful, ARMED is a substring of DISARMED."""
     return "ARMED" in resp and "DISARMED" not in resp
@@ -37,6 +47,41 @@ class TestSystemInfo:
     def test_version(self, raiden):
         r = raiden.cmd("VERSION")
         assert "Raiden Pico" in r
+
+    def test_version_reports_console_transport(self, raiden):
+        """VERSION must say which link carries the CLI.
+
+        UART0/GP0/GP1 is owned either by the ChipSHOUTER or by the console
+        (build option RAIDEN_CONSOLE_UART) — never both. The VERSION readout is
+        the only way the host can tell which binary is actually on the chip.
+        """
+        r = raiden.cmd("VERSION")
+        assert "Console:" in r, "VERSION must report the console transport"
+        assert ("UART0" in r) or ("USB CDC only" in r)
+
+    def test_cs_matches_console_transport(self, raiden):
+        """CS is available iff the console does NOT own UART0.
+
+        Both branches are asserted, so this test is meaningful against either
+        build instead of being skipped on one of them.
+        """
+        console_owns_uart0 = "ChipSHOUTER disabled" in raiden.cmd("VERSION")
+        r = raiden.cmd("CS STATUS", wait=3)
+        if console_owns_uart0:
+            assert "ERROR" in r and "UART0" in r, (
+                "CS must refuse explicitly when the console owns UART0, "
+                "never silently no-op"
+            )
+        else:
+            assert "CS unavailable" not in r
+
+    def test_pins_names_the_uart0_owner(self, raiden):
+        """PINS must show who owns GP0/GP1 in this build (pins skill, rule 2)."""
+        r = raiden.cmd("PINS", wait=2)
+        assert "GP0" in r
+        assert ("ChipSHOUTER UART TX" in r) or ("CLI console UART0 TX" in r), (
+            "PINS must name the current owner of GP0/GP1"
+        )
 
     def test_status_fields(self, raiden):
         r = raiden.cmd("STATUS", wait=2)

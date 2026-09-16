@@ -48,6 +48,14 @@ cd $PICO_SDK_PATH && git submodule update --init --recursive && cd -
 # Build
 ./build.sh
 
+# Optional: also expose the CLI on UART0 (GP0/GP1), in addition to USB.
+# Lets the console travel through an external USB-UART bridge (e.g. the
+# FaultyCat's `uart enter` passthrough on CH0/CH1 -> its CDC3).
+# MUTUALLY EXCLUSIVE with the ChipSHOUTER, which owns the same UART0/pins:
+# with this option, chipshot_uart_{init,process}() are not called and the CS
+# command refuses explicitly. `VERSION` reports which variant is on the chip.
+cmake -S . -B build -DBOARD=pico2 -DRAIDEN_CONSOLE_UART=ON && make -C build -j
+
 # Flash
 # 1. Hold BOOTSEL button while plugging in USB
 # 2. Copy UF2 file:
@@ -932,12 +940,21 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 
 ### Default Pinout
 
+- **GPIO 0 / GPIO 1** - UART0: ChipSHOUTER by default, **CLI console** with
+  `-DRAIDEN_CONSOLE_UART=ON` (mutually exclusive — see below)
 - **GPIO 2** - Glitch output (default)
 - **GPIO 4** - Target UART TX (bootloader/bypass)
 - **GPIO 5** - Target UART RX (bootloader/bypass, also PIO monitored for UART triggers)
 - **GPIO 15** - Target reset / nRST (active low)
 
 ### ChipSHOUTER Connection
+
+> **GP0/GP1 have two possible owners, never both at once.** By default they are
+> the ChipSHOUTER's UART0. Built with `-DRAIDEN_CONSOLE_UART=ON` they carry the
+> **CLI console** (115200 8N1, in addition to USB) and the ChipSHOUTER is
+> disabled — `CS` then returns an explicit error and `PINS` / `VERSION` say so.
+> Same kind of multiplexing as UART1 between Target and GRBL, except this one is
+> decided at build time.
 
 - **GPIO 0** - ChipSHOUTER UART TX
 - **GPIO 1** - ChipSHOUTER UART RX

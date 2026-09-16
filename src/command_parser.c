@@ -374,6 +374,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("  !  = Command failed (use ERROR to get details)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== ChipSHOUTER Control ==\r\n");
+#if RAIDEN_CONSOLE_UART
+        uart_cli_send("UNAVAILABLE: console UART owns UART0 (GP0/GP1). CS returns an error.\r\n");
+#else
         uart_cli_send("CS ARM                    - Arm ChipSHOUTER\r\n");
         uart_cli_send("CS DISARM                 - Disarm ChipSHOUTER\r\n");
         uart_cli_send("CS FIRE                   - Trigger ChipSHOUTER\r\n");
@@ -385,6 +388,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("CS VOLTAGE [<150-500>]    - Set/get ChipSHOUTER voltage (V)\r\n");
         uart_cli_send("CS HVOUT                  - Query HV output status\r\n");
         uart_cli_send("CS FAULTS                 - Get ChipSHOUTER fault status\r\n");
+#endif
         uart_cli_send("\r\n");
         uart_cli_send("== Clock Generator ==\r\n");
         uart_cli_send("CLOCK [<freq>] [ON|OFF]   - Set/get clock frequency and enable/disable\r\n");
@@ -528,6 +532,13 @@ void command_parser_execute(cmd_parts_t *parts) {
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
         uart_cli_send("Raiden Pico Glitcher v0.7\r\n");
+        // Quel lien porte cette CLI : c'est la seule facon de savoir, depuis
+        // l'hote, quelle variante de binaire est reellement sur la puce.
+#if RAIDEN_CONSOLE_UART
+        uart_cli_send("Console: USB CDC + UART0 GP0/GP1 @115200 (ChipSHOUTER disabled)\r\n");
+#else
+        uart_cli_send("Console: USB CDC only (UART0 GP0/GP1 = ChipSHOUTER)\r\n");
+#endif
     } else if (strcmp(parts->parts[0], "STATUS") == 0) {
         glitch_config_t *cfg = glitch_get_config();
         system_flags_t *flags = glitch_get_flags();
@@ -950,9 +961,15 @@ void command_parser_execute(cmd_parts_t *parts) {
 
         uart_cli_send("=== Pin Configuration ===\r\n\r\n");
         uart_cli_send("== Communication ==\r\n");
+#if RAIDEN_CONSOLE_UART
+        uart_cli_send("USB  - CLI (ttyACM0, USB CDC) + UART0 ci-dessous\r\n");
+        uart_cli_send("GP0  - CLI console UART0 TX @115200 8N1  <-- ChipSHOUTER DISABLED\r\n");
+        uart_cli_send("GP1  - CLI console UART0 RX @115200 8N1  <-- ChipSHOUTER DISABLED\r\n");
+#else
         uart_cli_send("USB  - CLI (ttyACM0, USB CDC)\r\n");
         uart_cli_send("GP0  - ChipSHOUTER UART TX (UART0)\r\n");
         uart_cli_send("GP1  - ChipSHOUTER UART RX (UART0)\r\n");
+#endif
         uart_cli_send("GP4  - Target UART TX (UART1, bootloader/bypass TX)\r\n");
         uart_cli_send("GP5  - Target UART RX (UART1, bootloader/bypass RX, also PIO monitored)\r\n");
         uart_cli_send("\r\n");
@@ -1813,6 +1830,15 @@ void command_parser_execute(cmd_parts_t *parts) {
         }
 
     } else if (strcmp(parts->parts[0], "CS") == 0) {
+#if RAIDEN_CONSOLE_UART
+        // UART0 porte la console : le ChipSHOUTER n'est pas initialise et ses
+        // broches sont en fonction UART stdio. Refuser franchement plutot que
+        // d'ecrire dans le vide -- une commande de glitch qui ne part pas sans
+        // le dire est exactement ce que la discipline CLI interdit.
+        api_error_printf("ERROR: CS unavailable - console UART owns UART0 (GP0/GP1)\r\n");
+        uart_cli_send("       Rebuild without -DRAIDEN_CONSOLE_UART=ON to use the ChipSHOUTER\r\n");
+        goto api_response;
+#else
         extern void chipshot_uart_init(void);
         extern void chipshot_uart_send(const char *data);
         extern void chipshot_uart_process(void);
@@ -1999,6 +2025,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else {
             api_error_printf("ERROR: Unknown CS command '%s'\r\n", parts->parts[1]);
         }
+#endif  // RAIDEN_CONSOLE_UART
 
     } else if (strcmp(parts->parts[0], "API") == 0) {
         if (parts->count < 2) {

@@ -73,8 +73,14 @@ int main() {
     printf("Initializing glitch...\n");
     glitch_init();
 
+    // UART0 (GP0/GP1) appartient soit au ChipSHOUTER, soit a la console UART
+    // -- jamais aux deux. Voir l'option RAIDEN_CONSOLE_UART du CMakeLists.
+#if RAIDEN_CONSOLE_UART
+    printf("Console UART0 GP0/GP1 active - ChipShouter UART disabled\n");
+#else
     printf("Initializing ChipShouter UART...\n");
     chipshot_uart_init();
+#endif
 
     printf("Initializing target subsystem...\n");
     target_init();
@@ -121,8 +127,11 @@ int main() {
             uart_cli_clear_command();
         }
 
-        // Process ChipShouter UART
+        // Process ChipShouter UART -- muet quand la console possede UART0,
+        // sinon il consommerait les octets tapes par l'operateur.
+#if !RAIDEN_CONSOLE_UART
         chipshot_uart_process();
+#endif
 
         // Process Target UART
         target_uart_process();

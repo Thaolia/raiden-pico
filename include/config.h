@@ -7,6 +7,13 @@
 // UART Configuration
 // Note: CLI uses USB CDC (no GPIO pins required)
 
+// UART0 / GP0 / GP1 ont DEUX proprietaires possibles, jamais en meme temps :
+//   - par defaut : le ChipSHOUTER (ci-dessous) ;
+//   - avec -DRAIDEN_CONSOLE_UART=ON : la console CLI (stdio UART du SDK, meme
+//     peripherique et memes broches), et alors chipshot_uart_{init,process}()
+//     ne sont pas appeles et la commande CS refuse de s'executer.
+// C'est la meme forme de multiplexage que UART1 entre Target (GP4/GP5) et
+// GRBL (GP8/GP9), a ceci pres que celui-ci se decide a la compilation.
 #define CHIPSHOT_UART_ID uart0
 #define CHIPSHOT_UART_TX_PIN 0
 #define CHIPSHOT_UART_RX_PIN 1
