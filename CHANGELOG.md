@@ -7,6 +7,793 @@ same change (see the `version-bump` skill) and add an entry here.
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This file
 was started at v0.7, so pre-0.6 entries are summarized from git history.
 
+> **Numérotation de ce fork.** Cette branche part de `main` amont, qui publie
+> **v0.7**, et y ajoute le travail développé localement sous les numéros 0.8 à
+> 0.14. Ces numéros n'existent nulle part en amont : les conserver tels quels
+> laisserait croire que l'amont les a publiés. La version que `VERSION` imprime
+> est donc `v0.7-JLQ_AA/MM/JJ` — la base amont, suivie de l'auteur du fork et de
+> la date. Les sections 0.8 à 0.14 sont conservées telles quelles en dessous :
+> ce sont des notes prises au banc, elles restent le journal de développement du
+> fork.
+
+## [0.7-JLQ_26/09/16] — fork JLQ : BAT32G135, course SWD, PHY sur PIO
+
+Regroupe en une version publiable l'ensemble du travail mené en local sur les
+numéros 0.8 → 0.14, plus le chantier Wi-Fi resté non publié. Le détail de
+chaque étape est dans les sections ci-dessous, qui ne sont pas réécrites.
+
+### Added
+- **Cible Cmsemicon BAT32G135** (Cortex-M0+) : `TARGET BAT32`, décodage des
+  niveaux de protection 0/1/2 depuis OCDEN/OCDM, et la famille
+  `SWD BAT32 {RAMREAD, PROGRAM, WRITE, PATTERN, SECTORERASE, ARM, DISARM,
+  CHIPERASE}`. `RAMREAD` lit la flash *à travers le cœur* : c'est la seule
+  opération non destructive du lot, et la seule qui ne demande pas `CONFIRM`.
+- **Couche physique SWD sur PIO2** : `SWD PHY [BITBANG|PIO [<khz>]]` et
+  `SWD BENCH`. Le bit-bang a un délai par bit qui écrase la fenêtre de course —
+  `SWD RACE` refuse donc de tourner sur autre chose que PIO.
+- **Course au relâchement de reset** : `SWD RACE`, `SWD RACE SWEEP`,
+  `SWD RACE PERSIST`, contre l'écriture de `DBGSTOPCR.SWDIS` par le firmware
+  de la cible.
+- **Option `RAIDEN_CONSOLE_UART`** (OFF par défaut) : la CLI aussi sur UART0
+  GP0/GP1. Exclusion mutuelle franche avec le ChipSHOUTER, qui possède les
+  mêmes broches — `CS` refuse alors explicitement au lieu d'écrire dans le vide.
+- **`BOARD=pico2w`** : CLI TCP sur Wi-Fi, en `lwip_poll` et non
+  `threadsafe_background` — cette dernière ferait tourner lwIP depuis une
+  interruption de fond, exactement l'asynchronisme qu'un firmware de glitch ne
+  peut pas tolérer près de sa fenêtre de tir.
+- **Outillage hôte** : `bat32_{dump,restore,dataflash,ramread_compare,
+  race_sweep,l1_ramread_test}.py` et `raiden_bridge.py` (relais TCP/pty).
+
+### Fixed
+- `pio_alloc` réserve les ressources PIO câblées en dur **avant** toute autre
+  initialisation. Sans cela le pilote CYW43 vole sa state machine à `swd_phy`
+  et rien ne le signale jusqu'à la première commande SWD.
+- La LED passe par `RAIDEN_LED_{INIT,SET}`. Sur Pico 2 W, GP25 est le
+  chip-select du CYW43 et non la LED ; `pico2_w.h` ne définit délibérément
+  aucun `PICO_DEFAULT_LED_PIN`, si bien qu'un `#define LED_PIN 25` en dur
+  compilait sans le moindre avertissement tout en tuant la liaison Wi-Fi.
+- `tests/conftest.py` draine le lien série pendant l'attente au lieu de dormir
+  en aveugle. Mesuré le 2026-09-05 : `HELP` émet 7828 octets, une attente
+  aveugle de 5 s en recevait 4888 (coupée dans `== ADC ==`) parce que le tampon
+  TX de l'USB CDC se remplissait sans lecteur et que `stdio_usb` jetait le
+  reste.
+
+### ⚠ Ce qui n'est PAS vérifié
+- **Le firmware de cette branche n'a pas été compilé** : aucun `PICO_SDK_PATH`
+  sur la machine où elle a été assemblée. Aucun `.uf2` n'en est issu, donc rien
+  ici n'a été flashé ni relu par `VERSION`.
+- **Les broches GP0/GP1** de l'option console : jamais câblées. Le test à un
+  fil qui tranche est de relier GP0 à GP1 et d'envoyer `VERSION` par l'USB — la
+  CLI parse alors sa propre réponse et doit rendre
+  `ERROR: Unknown command 'Raiden'`, ce qui prouve les deux sens du lien.
+- **La variante Wi-Fi** : écrite et câblée au build, jamais exécutée sur une
+  Pico 2 W.
+
+## [0.14] — 2026-09-05 — console CLI sur UART0 (GP0/GP1), en option
+
+### Statut : **compilé, flashé et vérifié sur le banc** — sauf le lien UART lui-même
+`VERSION` rend `v0.14` + `Console: USB CDC + UART0 GP0/GP1 @115200 (ChipSHOUTER
+disabled)`, `CS STATUS` et `CS ARM` renvoient l'erreur explicite, `PINS` nomme le
+bon propriétaire de GP0/GP1, et la CLI répond par les trois chemins hôte (USB
+direct, `socket://` et pty via `raiden_bridge.py`).
+
+⚠ **Ce qui n'est PAS vérifié : les broches GP0/GP1 elles-mêmes.** Aucun
+adaptateur USB-UART ni FaultyCat n'était câblé au banc. Le test à un fil qui
+tranche : **relier GP0 à GP1** (bouclage), puis envoyer `VERSION` par l'USB — la
+réponse repart par GP0, revient par GP1 et la CLI parse sa propre sortie, ce qui
+doit produire `ERROR: Unknown command 'Raiden'`. Cette erreur-là **prouve les
+deux sens** du lien.
+
+### Added
+- Option CMake **`RAIDEN_CONSOLE_UART`** (OFF par défaut) :
+  `pico_enable_stdio_uart(raiden_pico 1)` + `-DRAIDEN_CONSOLE_UART=1`. Le pilote
+  stdio du SDK multiplexe USB et UART — **aucun code métier à toucher**,
+  `src/uart_cli.c` est inchangé. Build :
+  `cmake -S . -B build -DBOARD=pico2 -DRAIDEN_CONSOLE_UART=ON`.
+- `VERSION` affiche désormais **le transport de la console** sur une seconde
+  ligne. C'est le seul moyen, depuis l'hôte, de savoir quelle variante de binaire
+  est réellement sur la puce — et c'est ce que le nouveau test utilise pour
+  rester valable contre les deux builds.
+
+### ★ Exclusion mutuelle avec le ChipSHOUTER — et pourquoi elle est franche
+`UART0`/`GP0`/`GP1` est **la** liaison ChipSHOUTER (`CHIPSHOT_UART_ID uart0`,
+`config.h`) et **aussi** le `PICO_DEFAULT_UART` que `pico_enable_stdio_uart`
+utilise sur Pico 2. Les deux ne peuvent pas posséder le même périphérique :
+
+- `chipshot_uart_init()` n'est pas appelé, et surtout **`chipshot_uart_process()`
+  non plus** — sans quoi il consommerait les octets tapés par l'opérateur sur la
+  console ;
+- la commande **`CS` refuse explicitement** (`ERROR: CS unavailable - console
+  UART owns UART0 (GP0/GP1)`) au lieu d'écrire dans le vide. Une commande de
+  glitch qui ne part pas sans le dire est exactement ce que la discipline CLI du
+  dépôt interdit ;
+- `PINS` et `HELP` nomment le propriétaire réel dans chaque variante.
+
+### ⚠ Le piège à connaître avant d'utiliser cette console
+Le pilote `stdio` UART du SDK est **bloquant** : attente active sur la FIFO TX,
+~87 µs par octet une fois pleine à 115200. Or `target_uart.c:1513` documente,
+mesures à l'appui, que quelques instructions de dispatch suffisent à rater la
+fenêtre de restauration du rail dans la boucle ADC. D'où la ligne de partage :
+
+- ✅ **le moteur de glitch PIO est immunisé** (il part du front matériel
+  GP15 → GP3, l'état du CPU lui est indifférent) — la campagne BAT32 ne risque
+  rien ;
+- ❌ **`VMIN` / ADC-gated ne l'est pas** : console silencieuse ou désactivée
+  pendant tout `SET VMIN`, ou à traiter comme le réseau (`net_quiet_*`).
+
+### Added — tests
+`tests/test_config_none.py` : `test_version_reports_console_transport`,
+`test_cs_matches_console_transport` (les **deux** branches sont assertées, donc
+le test a du sens contre l'une comme l'autre variante) et
+`test_pins_names_the_uart0_owner`. `test_cs_voltage_out_of_range` et
+`test_cs_pulse_out_of_range` deviennent conscients de la variante par l'aide
+`_console_owns_uart0()` : leur assertion `"range" in r` ne peut pas tenir quand
+la commande refuse en amont pour cause de propriétaire d'UART0.
+
+### ★ Fixed — `conftest.py` dormait pendant que la CDC débordait
+`RaidenClient.cmd()` faisait `write()` puis **`time.sleep(wait)` sans lire**,
+puis drainait. Sur une réponse longue, le tampon TX du CDC côté cible se
+remplit sans lecteur, `stdio_usb` atteint `PICO_STDIO_USB_STDOUT_TIMEOUT_US` et
+**jette la suite, en silence, au milieu d'une ligne**.
+
+Mesuré sur `HELP` (2026-09-05, firmware v0.14) :
+
+| Lecture hôte | Octets reçus | Sections |
+|---|---|---|
+| `sleep(5)` puis drain (ancien) | **4888** | 9 — coupé dans `== ADC ==` |
+| drain **pendant** l'attente (nouveau) | **7840** | **15** — complet |
+
+Le firmware émet 7828 octets d'aide (8398 dans la variante par défaut) et n'en
+a jamais perdu un seul : **c'était le harnais**. `cmd()` draine désormais
+pendant la fenêtre d'attente, la queue « jusqu'à 0,5 s de silence » est
+inchangée. C'est ce qui faisait échouer `test_help_has_sections`, dont la
+docstring soupçonnait le firmware à tort.
+
+⚠ Corollaire pour l'exploitation : **tout client qui dort avant de lire perd
+des octets** sur les réponses longues de ce firmware. Les scripts du dépôt
+utilisent déjà l'idiome `read(4096)` en boucle et ne sont pas concernés.
+
+### Résultats de la suite, sur cible BAT32 câblée (2026-09-05)
+
+```
+pytest tests/ -q --config=swd   ->  16 failed, 153 passed, 48 skipped (12:48)
+```
+
+⚠ **Il faut `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`** sur cette machine : les
+plugins système `salt.config` et `black` déclarent des hooks incompatibles avec
+pytest 9.1.1 et font échouer le démarrage de pytest lui-même (pas les tests).
+
+★ **Les 16 échecs sont exactement la ligne de base déjà documentée dans
+l'entrée *Unreleased*** — 14 + 1 + 1, mêmes fichiers, mêmes causes. **Aucun
+n'est imputable à v0.14**, et `test_help_has_sections`, qui échouait avant,
+passe maintenant :
+
+| Nombre | Où | Cause, vérifiable |
+|---|---|---|
+| **14** | `test_config_swd_bl.py` | exigent un **STM32 avec bootloader ISP UART** ; la cible câblée est un BAT32, qui n'en a pas (`No response from bootloader`) |
+| **1** | `test_config_none.py::test_target_bat32_swd_opt_no_wiring_fails_at_connect` | sa docstring pose « no target wired », or une cible SWD **est** câblée : `SWD OPT` réussit là où le test attend une erreur |
+| **1** | `test_config_swd.py::test_bat32_flash_erase_refused` | attend le libellé « read-only », changé en **v0.11** ; le refus fonctionne — `ERROR: BAT32G135 flash writes are under SWD BAT32, not SWD FLASH` — seul le texte diffère |
+
+Les tests destructifs (`--destructive`) n'ont **pas** été exécutés.
+
+⚠ **Le Pico a quitté le bus USB après la campagne de tests** — absent de `lsusb`,
+pas seulement de `/dev/ttyACM0`. Troisième occurrence connue de l'instabilité
+déjà consignée au §9sexies de `TPLink_Tapo/07_BAT32G135_FAULTYCAT.md`.
+**Chronologie mesurée** : la suite s'est terminée normalement, un `VERSION` a
+répondu après elle, puis la carte a disparu **au repos** — pas sous charge.
+Aucune conclusion tirée sur la cause. Reprise : débrancher/rebrancher l'USB
+(pas de FTDI sur ce poste, donc `scripts/reset_pico.py --wait` est indisponible).
+
+★ **La flash de la cible n'est pas en cause et n'a pas été touchée** : les tests
+destructifs sont restés ignorés, les seules écritures SWD de la suite visent la
+**SRAM** (`0x20000000`), et `SWD OPT` rendait `Level 0 / OCDEN=0xFF` avant comme
+après. Un reset de la cible efface les motifs de test laissés en SRAM.
+
+### ⚠ Deux constats de banc, non corrigés ici
+- **`CLAUDE.md` annonce `PICO_SDK_PATH=/home/software/unpacked/pico-sdk`, qui
+  n'existe pas sur cette machine.** Le SDK réellement utilisé est celui
+  **vendoré dans le dépôt** : `raiden-pico/pico-sdk` (c'est ce que porte
+  `build/CMakeCache.txt`).
+- **La carte du banc n'est pas une Pico 2 stock.** `STATUS` lit `PACKAGE_SEL` et
+  rapporte **RP2350B, QFN-80, 48 GPIOs, PSRAM** — une Pico 2 est une RP2350A
+  QFN-60. Le firmware est pourtant construit en `BOARD=pico2` et fonctionne.
+  **Aucune conclusion tirée ici** : changer `BOARD` déplacerait des affectations
+  de broches, ce n'est pas une décision à prendre en passant.
+
+## [Unreleased] — CLI TCP sur Wi-Fi (Pico 2 W) — étapes 1 et 2
+
+### Statut : étapes 1 et 2 **validées sur le banc**, la suite attend un Pico 2 W
+Firmware flashé et exercé sur le Pico 2 : `SWD CONNECT` bit-bang et PIO,
+`SWD RACE` (`SUCCESS`, SP=0x20000E10 PC=0x000001A9) et `SWD RACE PERSIST`
+(`READ_OK ACK=0x1`) — c'est-à-dire précisément ce que le pré-claim PIO et le
+préchargement nRST pouvaient casser.
+
+**Le même dump 64 Ko par les trois chemins donne le même md5** — USB direct,
+`socket://` via le pont, et pty via le pont : `6f37bd86…` (code) et `4a5114b8…`
+(data), 26 s par passe dans les trois cas.
+
+Suite de tests : **150 passés, 48 ignorés, 16 échecs**. Aucun ne semble
+imputable à ces changements — mais c'est une **attribution argumentée, pas une
+mesure** : il n'existe aucun firmware de référence committé d'avant cette
+session contre lequel rejouer la suite (l'arbre porte v0.11 à v0.13 non
+commitées), et reconstruire HEAD donnerait un binaire antérieur à `SWD BAT32`,
+donc sans valeur comparative. Les trois causes, chacune vérifiable dans le code
+ou le test lui-même :
+
+- **14** dans `test_config_swd_bl.py` : exigent une cible **STM32 avec
+  bootloader ISP UART**. La cible câblée est un BAT32, qui n'en a pas — le
+  firmware l'annonce lui-même, et l'échec dit « NO RESPONSE FROM BOOTLOADER ».
+- **1** dans `test_config_none.py` : sa propre docstring pose « No target is
+  wired in config_none », alors qu'une cible SWD est câblée sur ce banc, si
+  bien que `SWD OPT` réussit là où le test attend une erreur.
+- **1** dans `test_config_swd.py` : attend le libellé « read-only », changé en
+  **v0.11** quand `SWD FLASH` s'est mis à rediriger vers `SWD BAT32`. Le refus
+  fonctionne, seul le texte diffère — et `src/command_parser.c`, qui produit ce
+  message, n'a pas été modifié dans cette session.
+
+Non testé faute de matériel : tout le Wi-Fi (aucun Pico 2 W câblé). La baseline
+VMIN/TRACE (étape 0 du plan) n'est pas prise — elle exige le rail cible sur
+GP26. Plan complet : `~/.claude/plans/typed-nibbling-hearth.md`.
+
+### Added — côté hôte, mesuré
+- `scripts/raiden_bridge.py` — pont réseau dans les deux sens, sans dépendance
+  système (remplace `socat`, donc pas de `sudo`) : `serve` expose un port série
+  en TCP (permet d'exercer tout le chemin hôte **avant** que le firmware ne
+  parle TCP), `pty` expose une session TCP comme pseudo-terminal local.
+
+### ★ Fixed — `read(in_waiting)` est inutilisable sur une URL `socket://`
+Sur un socket, `in_waiting` de pyserial renvoie `len(select(...))` — **0 ou 1,
+jamais un nombre d'octets** (`serial/urlhandler/protocol_socket.py:136-142`). Or
+`bat32_dump.py` et `bat32_race_sweep.py` faisaient `read(in_waiting)` suivi d'un
+`sleep(0.02)`.
+
+Mesuré contre une réponse simulée de 8 Ko :
+
+| Idiome | Débit | Résultat |
+|---|---|---|
+| `read(in_waiting)` + `sleep(0.02)` | **49 o/s** | **tronqué en silence** |
+| `read(4096)` + settle | 40 500 o/s | complet |
+| `read(in_waiting)` **via le pont pty** | 201 000 o/s | complet |
+
+Vérifié ensuite sur le banc réel, dump 64 Ko complet : mêmes md5 et mêmes 26 s
+par les trois chemins. Deux réglages ont été nécessaires pour y arriver, tous
+deux mesurés : le `read()` de fin de réponse prend un timeout court (sinon
++38 s par dump), et le timeout du port descend à 0,05 s — `serial.read(n)` rend
+la main sur *n octets ou le timeout*, jamais « dès qu'il y a des données », ce
+qui doublait la durée.
+
+Les deux boucles passent donc sur l'idiome `read(4096)` déjà utilisé par
+`bat32_restore.py` — au passage, cela supprime le `sleep(0.02)` inconditionnel
+qui plafonnait aussi le débit USB. Les cinq scripts ouvrent maintenant leur port
+par `serial_for_url()`, qui accepte indifféremment `/dev/ttyACM0` et
+`socket://hôte:port`, avec `write_timeout=5` (le défaut `None` bloque à l'infini
+sur un socket).
+
+### Added — firmware : les trois pièges du portage Pico 2 W, corrigés d'avance
+- `src/pio_alloc.c` — `pio_resources_reserve()` réclame explicitement les 7 state
+  machines câblées en dur. Sans elle, le pilote CYW43 (qui itère les PIO en ordre
+  **décroissant**) prendrait **pio2 SM0**, celle de `swd_phy` : tout marcherait
+  jusqu'à la première commande SWD.
+- `swd_phy_preload_programs()` (`src/swd_phy.c`) — le programme PIO nRST n'était
+  chargé qu'au **premier `SWD RACE`**, depuis la section chronométrée : la
+  panique aurait été différée jusqu'à cette commande.
+- `src/main.c` — la LED passe par une abstraction : sur Pico 2 W, GP25 n'est pas
+  une LED mais le **chip-select du bus Wi-Fi**, et `pico2_w.h` ne définit
+  délibérément aucun `PICO_DEFAULT_LED_PIN`, donc l'ancien `#define LED_PIN 25`
+  aurait compilé sans warning en tuant la liaison.
+- `include/net_cli.h` — inclus **inconditionnellement** ; hors Wi-Fi tout se
+  réduit à des fonctions vides, ce qui permet d'écrire les sites d'appel sans un
+  seul `#ifdef` dans le code métier. Preuve : binaire `pico2` inchangé.
+- `src/net_cli.c` + `include/lwipopts.h` — Wi-Fi STA, poll, sections
+  silencieuses. `pico_cyw43_arch_lwip_poll` et **non** `_threadsafe_background`,
+  qui exécuterait lwIP depuis une interruption de fond.
+- `CMakeLists.txt` — `cmake -S . -B build -DBOARD=pico2w`.
+
+### Added — discipline temps réel : le glitch prime
+Même en mode poll, le pilote CYW43 arme une interruption GPIO **de niveau** sur
+son host-wake, sur `IO_IRQ_BANK0` — le vecteur dont `target_uart.c:1513`
+documente que quelques instructions de dispatch suffisent à faire rater la
+restauration du rail. `NET_QUIET_SECTION` masque **cette broche seule** (jamais
+`IO_IRQ_BANK0` entier, qui porte aussi nRST et GLITCH_FIRED) et suspend le poll ;
+l'interruption étant sur niveau, elle se redéclenche au réarmement — rien n'est
+perdu. L'attribut `cleanup` garantit la sortie malgré les `return`.
+
+Appliquée à : la fenêtre ADC de `power_glitch_once` (**sans** la surveillance
+nRST de 50 ms, qui affamerait le lien), et les deux variantes de `SWD RACE`.
+Dans `swd_race_once` la section s'ouvre **après** le diagnostic de câblage nRST,
+volontairement : ce `printf` distingue « nRST mal câblé » de « cible
+verrouillée » et ne doit jamais pouvoir être jeté. Point de relance entre deux
+tirs de sweep. Reste à faire : la section TRACE.
+
+## [0.13] — 2026-09-01 — `SWD BAT32 RAMREAD`: read flash through the core
+
+### Added
+- `SWD BAT32 RAMREAD <addr> [words]` → `swd_bat32_ram_read()` in
+  `src/swd.c`. Reads flash **through the target core**, sidestepping the
+  debugger-side flash block that Level 1 applies. It halts the core, writes
+  a 16-byte Thumb copier into SRAM at `0x20000000`, sets `r0`=source,
+  `r1`=`0x20000020` (buffer), `r2`=word count, `SP`=`0x20002000`,
+  `PC`=payload|1, resumes, waits for the trailing `BKPT` to re-halt, and
+  reads the buffer back over SWD. 1024 words (4 KB) per pass.
+
+  The copier, assembled by hand (ARMv6-M Thumb-16):
+  `6803 ldr r3,[r0]` · `600B str r3,[r1]` · `3004 adds r0,#4` ·
+  `3104 adds r1,#4` · `3A01 subs r2,#1` · `D1F9 bne -14` · `BE00 bkpt`.
+
+  Unlike every other `SWD BAT32` verb this one is **read-only on flash**, so
+  it does not take `CONFIRM` — but it **overwrites target SRAM
+  `0x20000000-0x2000101F`**, which is where the `.data` copied out of flash
+  at boot lives. At Level 1, dump SRAM *before* the first RAMREAD.
+
+### ★ Measured at Level 0 — the whole mechanism works
+The three premises that were *not* verified when this was written are now
+verified on the bench BAT32G135: **SRAM is writable**, `PC`/`SP` writes via
+`DCRSR`/`DCRDR` **are accepted**, and this ARMv6-M **does execute from
+SRAM**. Both paths agree byte for byte:
+
+| Region | RAMREAD (via core) | `SWD READ` (via debugger) |
+|---|---|---|
+| code flash, 64 KB @ `0x0` | `2d03db71e805d1c14b8389893feec4ed` | identical |
+| data flash, 1536 B @ `0x500000` | `4a5114b8114f61b1c8eb03537406a3cf` | identical |
+
+**35 s** for the 64 KB pass at `SWD SPEED 4` (the 70 s figure in the compare
+harness covers both paths interleaved). **What is still untested is the only
+thing that matters for the bypass: whether this works at Level 1.**
+
+⚠ That code-flash md5 is **not** the reference `6f37bd86…` of 2026-08-31:
+20 945 bytes of the bench part now read `0xFF` over `0x3340-0x454F` and
+`0x8000-0xC15F`. Both read paths agree on that, so it is the part that
+changed, not the reading — the post-chip-erase restore did not put
+everything back. `assets/bat32_dump_20260831/bat32_code_flash.bin` still
+held the intact image, and the part was **restored from it the same day**:
+84 blocks of 256 bytes in 203 s (an 85th had gone in during an
+earlier, interrupted attempt), read back over the debugger path as
+`6f37bd86c41a75c19db65cc5824f7199` — byte-identical to the original. The
+degraded state is kept in `assets/bat32_dump_20260901/` as a record.
+
+### Fixed — ★ 1 KB TAR window: `swd_read_mem()`/`swd_write_mem()` silently wrapped
+ADIv5 only guarantees TAR auto-increment **inside a 1 KB window**; past the
+boundary the AP wraps back to the start of that window and re-serves data
+already transferred, with no error anywhere. Both functions armed TAR once
+and then looped over `DRW`, so **any transfer crossing a 1 KB boundary
+returned wrong data** — the first 4 KB `RAMREAD` was correct up to offset
+`0x3E0` (= `0x20000400`) and repeated itself from there.
+
+This was not specific to RAMREAD: every caller passing a range that crosses
+a 1 KB boundary was affected. It went unnoticed because `SWD READ` chunks
+by 64 words from an aligned base, and the validated 64 KB dumps happen to
+start aligned. Both functions now re-arm CSW+TAR at every window crossing.
+
+### Added — diagnostics that make a Level 1 failure legible
+- `DEMCR` now sets `VC_HARDERR` alongside `TRCENA`: a payload that faults
+  halts immediately instead of surfacing as the same 500 ms timeout as
+  "the core never ran".
+- After the halt, `PC` must be on one of the two trailing `BKPT`s
+  (payload+`0x0C`/+`0x0E`); any other `PC` is reported with `DFSR` and the
+  buffer is refused rather than returned as if it were flash.
+- `S_LOCKUP` is distinguished from "still running" in the timeout message.
+- A misaligned `<addr>` is rejected up front, in the parser and in
+  `swd_bat32_ram_read()` — `ldr r3,[r0]` would fault on ARMv6-M and read
+  as "the bypass does not work".
+
+### ★★ Found — `CHIPERASE` does NOT erase the data flash, and `SECTORERASE` is what does
+Measured 2026-09-02. After a `SWD BAT32 CHIPERASE CONFIRM` that reported
+success and left the code flash uniformly `0xFF`, `0x00500008` still held the
+sensor's pairing record (`AA 55 AA 55 "device_id"`), **byte-identical to the
+pre-erase dump**. Re-triggering the same erase with its dummy write aimed at
+`0x00500000` instead of `0x00000000` changed nothing: the data flash array is
+simply outside what `FLERMD=0x08` covers.
+
+This contradicts the firmware's own message ("code + data flash"), this
+changelog's v0.11 entry, and §7.4 of `TPLink_Tapo/07_BAT32G135_FAULTYCAT.md`.
+
+**What it changes for Level 1:** the only documented way out of Level 1 is the
+chip erase — and it now turns out that escape **preserves the data flash**.
+The pairing, and anything else living at `0x500000`, survives the round trip.
+That is a materially better position than "Level 1 costs you the pairing".
+
+`CHIPERASE` keeps erasing the code flash only, deliberately: escaping Level 1
+costs a chip erase, and the part happens to keep its data flash through it —
+destroying that on the caller's behalf would throw away a pairing the hardware
+was willing to preserve. The CLI help and the progress line say so now.
+
+### Added — `SWD BAT32 SECTORERASE <addr> CONFIRM`
+`swd_bat32_sector_erase()` in `src/swd.c` — the vendor driver's `FLERMD=0x10`,
+documented in the v0.11 entry as existing but never wired up. It is the **only**
+way to blank the data flash. `<addr>` is any address inside the sector to erase;
+erasing a code-flash sector works the same way and is equally destructive, hence
+`CONFIRM`.
+
+**Measured: the data-flash sector is 512 bytes.** One erase at `0x500000`
+blanked `0x500000-0x5001FF` exactly; the 1.5 KB array takes three
+(`0x500000`, `0x500200`, `0x500400`).
+
+### ★ Measured — the data-flash write path works
+`bat32_dataflash.py restore` put the 2026-09-01 image back onto a freshly
+blanked data flash and read it back after a reset as
+`4a5114b8114f61b1c8eb03537406a3cf` — exact. The probe-block mechanism did its
+job on the way (first block written and verified alone before the rest). Until
+this run, no byte had ever been programmed at `0x500000` by this firmware.
+
+### ★ Found — a BAT32 flash read with the core RUNNING returns prefetch, not memory
+Measured 2026-09-02 on an unmodified part: with the core running, `0x00004910`
+read back `70 47 C0 46` (`bx lr; nop` — code the core was executing), and
+`FF FF FF FF` immediately after `SWD HALT`, reproducibly, three passes. A halt
+cannot erase flash: the *read* is what was wrong. Intermittently, a debugger
+read is served the core's prefetch instead of the requested address.
+
+Consequences, all confirmed on the bench:
+- A `bat32_restore.py` diff taken with the core running invented 9 changed
+  bytes across 3 blocks, one of them flagged as needing an erase (bits 0→1).
+  With `SWD HALT` first, the same part shows **exactly 1 changed byte** — a
+  deliberate edit by the operator. The whole "the part has drifted again"
+  alarm was the read, not the part.
+- The four "corrupted bytes at `0x4664`" that `bat32_dump.py`'s verification
+  pass once caught were almost certainly this, not a flaky link.
+- The v0.13 validation above was **not** affected: RAMREAD halts the core and
+  its payload ends on `BKPT`, so the core stays halted for everything after
+  the first pass — which is exactly why both paths agreed across 64 KB.
+
+`bat32_dump.py` (`--no-halt` to opt out), `bat32_restore.py` and
+`bat32_ramread_compare.py` now halt the core before reading anything.
+`bat32_restore.py` additionally **resets the target before its verification
+read**: a read chained straight onto programming can be served by the flash
+controller's buffer and confirm a value the cell does not hold.
+
+⚠ The `6f37bd86…` reference image was dumped **before** this was known, i.e.
+with the core running. Three passes agreed (two bitbang + one PIO), which
+argues the artifact did not hit them — but that is not the same as proof.
+Treat it as a caveat on the reference until a halted re-dump confirms it.
+
+### Added — host-side harnesses
+- `scripts/bat32_ramread_compare.py` — the reproduction for the table above.
+  `--mode compare` demands RAMREAD and `SWD READ` agree (Level 0, tests the
+  mechanism); `--mode ref` compares against a reference image, for Level 1
+  where `SWD READ` faults and no second path exists.
+- `scripts/bat32_dataflash.py` — `backup` / `restore` for the **data flash**
+  (`0x00500000`), where the sensor's pairing lives; a chip erase (the only way
+  out of Level 1) takes it too. Backup reads twice and refuses if the passes
+  disagree. Restore excludes the `OCDM`/`BTEN` block by default and refuses
+  outright to write `OCDM = 0x3C` (Level 2, no way back), and — since the write
+  path has never been exercised at `0x500000` — writes **one probe block
+  first**, verifies it after a reset, and only then writes the rest.
+  Measured while testing it: the data flash is **live** — 12 bytes changed in
+  ten minutes of normal operation (counters plus a journal at `0x00500453`),
+  and some increments raise bits back to 1, so the sensor erases pages itself.
+- `scripts/bat32_restore.py` — restores code flash from an image, writing only
+  the blocks that differ. It refuses up front any block needing a 0→1 bit
+  (programming only clears bits; that case needs an erase) and only reports
+  success **after reading the part back**. This is what the 2026-09-01 restore
+  lacked: it left 20 945 bytes at `0xFF` and nobody saw it.
+
+### Fixed — `scripts/flash.sh` could not find the bootloader volume
+It looked only under `/media/$USER`; udisks2 mounts under `/run/media/$USER`,
+and with no session automounter nothing mounts at all. It now checks both
+and mounts the `RP2350`-labelled volume itself via `udisksctl` (no root).
+It also waited only 0.5 s after opening the CDC port before sending
+`REBOOT BL` — but opening that port restarts the firmware, so the command
+landed mid-init and was dropped. It now waits for the CLI to answer first.
+
+## [0.12] — 2026-09-01 — `SWD RACE PERSIST`, and what it proved about Level 1
+
+### Added
+- `SWD RACE PERSIST <delay_us> [ADDR <hex>]` (`swd_race_persistent()` in
+  `src/swd.c`). `SWD RACE` re-establishes everything after releasing nRST —
+  line reset, JTAG-to-SWD, DPIDR, AHB-AP bring-up — so its first memory
+  access lands ~250 µs after the reset edge, far too late for §8.3's
+  *window A*. This variant bets that nRST resets the core and system but
+  **not** the SW-DP/AHB-AP: it pre-loads CSW and TAR *before* touching
+  nRST, then issues only the DRW read afterwards. First access lands within
+  microseconds instead of hundreds.
+- `ADDR` lets the probe target any address, which is what turned up the
+  SRAM result below.
+
+### Measured — the bet pays off, and window A is unwinnable anyway
+**The DP and AHB-AP do survive nRST** (`ACK=0x1` even at delay 0), so the
+short sequence works. With it:
+
+| Delay after nRST release | Level 0 | Level 1 |
+|---|---|---|
+| 0 → 440 µs | `READ_OK`, `0x00000000` | `READ_OK`, `0x00000000` |
+| 450 µs onward | `READ_OK`, **`0x20000E10`** | **`FAULT` (ACK=0x4)** |
+
+Sharp transition between 440 and 450 µs, 9 shots each side, no scatter.
+**No sliver exists** where a protected part returns real data: protection
+latches exactly when memory becomes accessible. Shortening the sequence
+further cannot help — arriving earlier simply yields nothing.
+
+⚠ **Correction to the v0.11 entry's reading.** That "zeros before 450 µs"
+window is *not* a flash macro waking up: **SRAM returns zeros there too**,
+at both protection levels. It is the whole system held in reset — the debug
+AP survives, but the AHB bus behind it answers nothing.
+
+### ★ SRAM is fully readable at Level 1 — protection covers flash only
+Same run, same instant (600 µs after reset release): flash `0x0` faults
+(`ACK=0x4`) while **SRAM `0x20000008` reads back its real value**
+(`0xE864F825`), and a direct 64-byte read of `0x20000000` returns content
+identical to what Level 0 shows. The §2.3 truth table only ever restricted
+"données flash"; that is now confirmed to be literal.
+
+This matters because C startup copies `.data` **out of flash into SRAM at
+every boot** — so flash-derived content is recoverable at Level 1 without
+ever reading flash. Combined with the fact that the core can still be
+halted at Level 1, the untested next step is injecting a payload into SRAM
+and letting the core (which *is* allowed to read flash) copy it out. See
+§2bis.5 of `TPLink_Tapo/07_BAT32G135_FAULTYCAT.md`.
+
+## [0.11] — 2026-09-01 — BAT32G135 flash writes, and a full Level 1 round trip
+
+### Added — `SWD BAT32 <op> ... CONFIRM`
+`PROGRAM <addr> <byte>` · `WRITE <addr> <hex>` (256 B/command) ·
+`PATTERN <addr> <len>` (blank-only bulk test) · `ARM` (OCDEN → 0xC3) ·
+`DISARM` (OCDEN → 0x83) · `CHIPERASE`. Every form requires a literal
+`CONFIRM` as the last token, and all argument validation happens before any
+hardware is touched. `SWD FLASH` now redirects BAT32 here instead of
+refusing outright; `SWD RDP` still refuses (wrong protection model).
+
+Backing functions `swd_bat32_flash_program()` / `swd_bat32_chip_erase()`
+(`src/swd.c`) are transcribed from **Cmsemicon's own `Driver/src/flash.c`**
+in the official CMSIS pack (`Cmsemicon.BAT32G135.1.0.4.pack`), which is
+authoritative and **corrects `07_BAT32G135_FAULTYCAT.md` §7.4**:
+
+| | Doc §7.4 | Vendor driver |
+|---|---|---|
+| Program granularity | "mot 32 bits" | ★ **byte** — `FLOPMD1/2` re-armed before *every* byte |
+| `FLERMD` | `0x8` chip erase | `0x08` ✓, and **`0x10` = sector erase** (absent from doc) |
+| After the operation | — | **`FLERMD=0x00`**, **`FLPROT=0xF0`** (re-lock) |
+| Timing registers | — | `FL*CNT` never touched; resets are usable |
+
+Byte granularity is what let OCDEN be armed **without disturbing the
+WDT/LVD/HOCO bytes sharing its 32-bit word**.
+
+### Fixed
+- `swd_bat32_flash_program()` / `_chip_erase()` clear sticky errors first.
+  At Level 1 a flash read returns FAULT (ACK=0x4), latching `STICKYERR`,
+  after which **every** AP transaction fails until `DP_ABORT`. Without the
+  clear, the CLI's own read-back probe poisoned the link and the subsequent
+  core halt failed — which made a refused-write look like a broken halt.
+- Chip erase no longer aborts when the core cannot be halted. At Level 1 the
+  core often can't be, and refusing there would disable the one escape hatch
+  precisely when it is needed.
+
+### Measured on real hardware — a full arm/measure/recover cycle
+The BAT32G135 was deliberately put into protection Level 1 and brought back.
+**Final state: Level 0, code flash md5 `6f37bd86c41a75c19db65cc5824f7199`,
+byte-identical to the pre-existing reference dump.** This answers two
+questions `07_BAT32G135_FAULTYCAT.md` had left open since it was written:
+
+- ★ **§12 open question #2 — "at protection level N, does the DP still
+  answer?" → YES, it is a "soft" target.** At Level 1: `DPIDR=0x0BC11477`
+  and `CPUID=0x410CC601` (Cortex-M0+ r0p1) read fine, so the AHB-AP and the
+  ARM debug/SCS space stay reachable — but every *flash* access faults
+  (`ACK=0x4`), code and data flash alike, option bytes included.
+- ★ **Chip erase IS reachable over SWD at Level 1** (undocumented; the
+  manual only says it is "permitted"). It cleared OCDEN back to 0xFF and
+  restored Level 0. **Programming, by contrast, is refused** at Level 1 —
+  `OCDEN 0xC3 → 0x83` failed at the first byte, confirming the §2.3 truth
+  table's "lecture et écriture interdites" empirically.
+
+- `SWD RACE` under Level 1 returned **`dp_only` at all six delays**
+  (0/100/520/800/1400/2000 µs), as predicted: OCDEN is §8.3's *window A* —
+  static, re-applied at every reset, with no temporal window to hit. The
+  race targets *window B* (`DBGSTOPCR.SWDIS`, written by firmware at
+  runtime). Arming OCDEN therefore does **not** exercise the race, and this
+  run should not be read as having tested it.
+
+## [0.10] — 2026-09-01 — SWD physical layer on PIO2, for a genuinely usable `SWD RACE`
+
+### Why
+
+§0bis (added in v0.9's wake) found that the BAT32G135 on this bench was never
+protected — the entire `SWD RACE` investigation had been chasing a sampling
+artifact of `SWD SPEED 0`, not a real timing race. But `SWD SPEED 0` was also
+the *only* bit-bang speed fast enough to fit inside the race window at all
+(§8.3's cited 20us-1600us, from the GD32/OFFZONE deck) — every other SPEED
+value takes single-digit milliseconds for connect + AHB-AP bring-up + a
+2-word read, ~1000x too slow. The contradiction `SWD RACE`'s own guard and
+§0bis leave unresolved: the only fast-enough speed is the one that mis-reads.
+§9quinquies.3 named the fix directly (translated from the doc's French):
+"the real fix would be a reimplementation of SWD in PIO ... this is work
+not done here." This entry is that work.
+
+### Added
+- `src/swd_phy.pio` + `src/swd_phy.c` + `include/swd_phy.h`: a PIO SWD
+  physical layer on **PIO2** (entirely free — PIO0 is 22-32/32 words
+  depending on trigger mode, PIO1 is 31/32; see `PIO_ARCHITECTURE.md`'s
+  8-SM/64-word claim is wrong for the RP2350, it's 3 blocks x 4 SM x 32
+  words). The `swd_phy` program (PIO2 SM0) is a direct, credited port of
+  [raspberrypi/debugprobe](https://github.com/raspberrypi/debugprobe)'s
+  `probe.pio` (MIT license, full header kept in the file) — its
+  command-word protocol (bit count + SWDIO direction + jump target) is
+  reused verbatim because the bidirectional SWDIO turnaround it encodes is
+  the one genuinely hard part of a PIO SWD phy, and debugprobe already gets
+  it right. A second program, `swd_phy_nrst` (PIO2 SM1), is new: a one-shot
+  nRST assert/hold-tRSL/release/wait-delay_us sequencer for `SWD RACE`,
+  removing the C-side jitter between "reset released" and "first SWCLK
+  edge" (previously two `busy_wait_us_32()` calls around a `sleep_us()`
+  bit-clock).
+- `swd.c`'s bit-bang primitives (`swd_seq_out`/`swd_seq_in`/
+  `swd_turnaround`) now dispatch to the PIO phy when active; everything
+  above them (DP/AP transactions, `swd_read_mem`, `SWD OPT`, the STM32/LPC
+  paths) is unchanged and phy-unaware, by design — the PIO layer replaces
+  only the physical bit-clocking, not the ADIv5 protocol logic.
+  `swd_seq_out_parity`/`swd_seq_in_parity` were also simplified to emit
+  their parity bit via `swd_seq_out(bit,1)`/`swd_seq_in(1)` instead of
+  duplicated raw-GPIO code — that raw code would have silently done nothing
+  once GP17/18's funcsel moved to PIO (a real, easy-to-miss hazard: a
+  PIO-owned pin ignores `gpio_put()`).
+- `SWD PHY [BITBANG|PIO [<khz>]]` — get/set the physical layer, default
+  `BITBANG` (PIO is opt-in, not a silent behavior change on existing
+  workflows). Forces a reconnect (funcsel changes underneath either way).
+- `SWD BENCH` — times a fast connect + AHB-AP bring-up + 2-word read (the
+  same sequence `SWD RACE` runs per attempt, without touching nRST) at
+  whatever phy/speed is active. The before/after measurement tool for this
+  change.
+- `SWD RACE` now requires `SWD PHY PIO` instead of `SWD SPEED 0` (the old
+  guard's premise — that bit-bang is merely *slow* at anything but SPEED
+  0 — was only ever half true; SPEED 0 doesn't work at all on this bench).
+
+### Known, deliberate deviations (not bugs)
+- `swd_phy_turnaround(true)` (SWDIO FLOAT→DRIVE) sets pindir to output
+  *before* the turnaround clock, where the bit-bang path sets it *after*.
+  Protocol-safe: ADIv5 defines the turnaround bit's SWDIO value as a
+  don't-care on both sides, so the exact instant direction flips within
+  that one clock cycle carries no semantic weight. Chosen over a more
+  intricate PIO design to match, because there was no hardware available
+  this session to validate the fancier version (see below).
+- The FIFO-preload race hand-off originally sketched (SM0 pre-armed to
+  jump straight into a command sequence on an SM1 IRQ) was dropped in favor
+  of a simpler design: SM1 runs the full nRST sequence autonomously and
+  signals PIO2 IRQ 4 on completion; the CPU busy-polls that flag (no sleep)
+  and then calls the ordinary `swd_connect_ex(true)` path, which issues PIO2
+  SM0 commands on demand exactly as it always has. This trades a slightly
+  larger (but still sub-microsecond-class) CPU dispatch latency for far
+  less PIO code to get right without being able to test on real hardware.
+
+### Validated on real hardware, 2026-09-01
+
+- ★ **Byte-exact dump via the PIO phy.** `scripts/bat32_dump.py --phy pio
+  --phy-khz 2500` produced a 64 KB code-flash image with md5
+  `6f37bd86c41a75c19db65cc5824f7199` — **identical byte for byte** to the
+  bit-bang reference in `assets/bat32_dump_20260831/`, `cmp` clean. This is
+  the decisive test: a phy that reproduces that md5 is correct at the
+  physical layer. The run printed `Dump complet et verifie` (both flash
+  regions re-read and reconciled).
+- **`SWD RACE` positive control: 7 SUCCESS / 7 shots** at delays 0, 50, 100,
+  520, 800, 1400, 2000 us, every one reporting SP=0x20000E10 PC=0x000001A9
+  (the chip's real reset vector). Proves the whole race path — PIO2 SM1 nRST
+  sequencer, IRQ hand-off, SM0 connect — runs end to end. As stated below, it
+  cannot prove the race would beat a real `SWDIS` write.
+- `config_none` regression suite: 96 passed, 0 failed.
+
+### Measured latency, and two corrections this entry had to make to itself
+
+`SWD BENCH` (connect + AHB-AP bring-up + 2-word read — the same sequence
+`swd_race_once()` runs), final numbers on the BAT32G135:
+
+| Phy | Total | connect | ahb | read |
+|---|---|---|---|---|
+| BITBANG `SPEED 4` | 8 755 us | 2 148 | 3 974 | 2 633 |
+| BITBANG `SPEED 1` | 2 351 us | 611 | 1 063 | 677 |
+| PIO 1000 kHz | 1 159 us | 355 | 415 | 389 |
+| PIO 2500 kHz | **531 us** | 155 | 205 | 171 |
+| PIO 4000 kHz | 369 us | 116 | 136 | 117 |
+| PIO 8000 kHz | **249 us** | 87 | 91 | 71 |
+
+**Gain: 16.5x** at PIO 2500 kHz vs BITBANG `SPEED 4`, 35x at 8 MHz. At
+8 MHz the whole race sequence takes **249 us**, comfortably inside the
+20 us–1600 us window §8.3 cites.
+
+Two claims this entry made earlier were wrong, in opposite directions, and
+both are retracted:
+
+1. **"20x to 80x"** was written from an estimate, not a measurement. It was
+   then "corrected" to a measured **7.8x with a ~1.3 ms frequency-independent
+   floor** — and *that* was wrong too, because the benchmark itself was
+   buggy: `swd_bench()` cleared `ahb_initialized` and never set it back, so
+   `swd_read_mem()` took the `!ahb_initialized` branch and re-ran the entire
+   bring-up through `swd_init_ahb_ap()` — the `fast=false` variant, with its
+   unconditional `sleep_ms(1)` — *inside the timed read phase*. That one
+   missing line was ~1.2 ms of the supposed floor. **`swd_race_once()` was
+   never affected** (it sets the flag correctly): the race path was always
+   this fast; only the measurement lied. Fixed, with a comment at the site.
+   The lesson that stuck: instrument the phases *before* forming a theory —
+   the per-phase split is now part of `SWD BENCH`'s output and of
+   `swd_bench_split_t`.
+2. The USB CDC `printf` in `swd_connect_ex()`'s success path was blamed for
+   that floor. Removing it from the `fast` path bought only ~7%. It stays
+   removed (a blocking stdio call has no business inside a timed critical
+   section) but it was not the cause.
+
+### Sequence shortened
+- `swd_init_ahb_ap_ex(fast=true)` no longer reads `AP_IDR`. The value was
+  read into a local and **never used anywhere in the file**, costing a full
+  AP read (posted read + `RDBUFF` DP read, plus a `DP_SELECT` write since
+  IDR sits in APBANKSEL 0xF while CSW is in bank 0) on every bring-up.
+  Measured: 272 → 249 us total at 8 MHz, `ahb` 115 → 91 us. `fast=false` is
+  unchanged, so the STM32/LPC workflows keep the bring-up they were
+  validated with.
+- Still on the table if a genuinely locked part needs more: the `DPIDR`-only
+  oracle (§8.1 — no AHB-AP, no TAR/DRW at all) and dropping the per-word
+  `RDBUFF` read in `swd_read_ap()`. Not needed at 249 us.
+
+Re-verified after both optimisations: full dump via PIO still byte-identical
+to the reference (`cmp` clean), `SWD RACE` still 4/4 SUCCESS.
+
+★ **This still cannot validate the race itself.** The BAT32G135 on this
+bench is Level 0 with `DBGSTOPCR.SWDIS` always 0 (§0bis) — it will connect
+at any delay, so `SWD RACE` reporting `SUCCESS` proves the mechanism works
+end to end, never that it would beat a real `SWDIS` write on a genuinely
+locked part.
+
+## [0.9] — 2026-08-31 — Trim `SWD RACE`'s AHB-AP bring-up
+
+### Changed
+- `swd_init_ahb_ap_ex(fast=true)`, used only by `SWD RACE`/`SWD RACE
+  SWEEP`: skips the `DP_ABORT` sticky-error clear (`swd_connect_ex(true)`
+  already did one right after reading DPIDR) and the power-down request +
+  ack-wait loop (the debug domain is guaranteed powered down immediately
+  after the hardware reset `swd_race_once()` just performed). Cuts two
+  bit-banged DP transactions from the critical path between reset-release
+  and AHB-AP being ready. `fast=false` (used by `SWD CONNECTRST` and
+  everything else) is unchanged.
+- Motivation, and why it no longer holds. This was made during a 2550-shot
+  sweep that found 13 `dp_only` hits and 0 getting past `swd_init_ahb_ap_ex`,
+  read at the time as "the race window closes before AHB-AP finishes".
+  ★ **That reading was wrong and is retracted.** Those hits were a sampling
+  artifact of running at `SWD SPEED 0`, which mis-samples on that bench: the
+  DPIDR they returned (`0x178028EF`) is a canonical ARM DPIDR shifted left by
+  one bit. At `SWD SPEED 4` the same target connects first try, and its
+  `DBGSTOPCR.SWDIS` is 0 — there was no race to win. See §0bis of
+  `TPLink_Tapo/07_BAT32G135_FAULTYCAT.md`.
+- The change itself is kept: skipping work the hardware reset already
+  guarantees is still correct, and it measurably doubled the hit rate under
+  the (bogus) conditions it was measured in. But it is now **unexercised** —
+  no current workflow uses `fast=true`, since the BAT32 path is a plain
+  `SWD CONNECT` at reduced speed. Anyone reviving `SWD RACE` for a genuinely
+  locked part should re-validate it, including that dropping the `DP_ABORT`
+  clear (which `fast=false` still performs) is safe on their target.
+
+## [0.8] — 2026-08-30 — SWD reset-release race + read-only BAT32G135 support
+
+### Added
+- `SWD RACE [<delay_us>]` and `SWD RACE SWEEP <start_us> <end_us> <step_us>
+  [SHOTS <n>]`: a reset-release timing race, distinct from `SWD
+  CONNECTRST`. Asserts/releases nRST, waits exactly `delay_us` (no
+  clamping, no compensation), then races to connect + bring up the AHB-AP
+  + read the reset vector before target firmware can lock SWD (e.g. by
+  writing a runtime SWD-disable bit). `SWD CONNECTRST` connects *before*
+  releasing reset and needs the SW-DP to answer while held in reset —
+  `SWD RACE` is for the opposite case, where it does not. Requires `SWD
+  SPEED 0` first. The SWEEP variant is bounded (max 200000 delay points x
+  1000 shots), aborts on any pending input, and stops immediately on the
+  first SUCCESS with the target left powered and connected (Level 0 does
+  not survive the next reset).
+- `swd_connect_ex(bool fast)` / internal `swd_init_ahb_ap_ex(bool fast)`:
+  a fast connect + AHB-AP bring-up path used by `SWD RACE`, skipping the
+  pin-settle delay, the ADIv5.2 dormant-state fallback, and the
+  unconditional 1ms wait before the first debug-power-up-ack check —
+  together the largest fixed costs on the reset-release critical path.
+  `swd_connect()` is unchanged (`swd_connect_ex(false)`).
+- `TARGET BAT32` — read-only support for the Cmsemicon BAT32G135
+  (Cortex-M0+): `SWD READ FLASH|SRAM` now resolve to its memory map, and
+  `SWD OPT` decodes OCDEN/OCDM/BTEN (both option-byte clusters, including
+  the boot-swap mirror) and `DBGSTOPCR.SWDIS`, printing the deduced
+  protection level (Level 0/1/2 per the official truth table). No flash
+  write/erase path is implemented — `SWD RDP` and `SWD FLASH ERASE`
+  explicitly refuse a BAT32 target rather than silently doing nothing.
+
+### Fixed
+- `SET PAUSE/WIDTH/GAP/COUNT/VMIN <value>` now validates the value via
+  `parse_u32()` and returns an explicit `ERROR:` on a malformed or
+  out-of-range token, instead of silently taking whatever `atoi()`
+  returned (garbage input, e.g. `SET PAUSE abc`, previously became 0).
+- `DBGMCU_CR` (0xE0042004, STM32-only) is no longer written unconditionally
+  by `SWD CONNECTRST`, and `DBG_IDCODE` (0xE0042000, also STM32-only) is
+  no longer read unconditionally by `swd_detect()` / `SWD IDCODE` — both
+  now check `target_is_stm32()` first (skipped, or read as "unknown", for
+  a target explicitly set to something else, e.g. BAT32G135).
+
 ## [0.7] — 2026-06-08 — ChipSHOUTER command fixes + hardening
 
 ### Fixed
