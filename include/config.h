@@ -49,6 +49,10 @@ typedef enum {
 } edge_type_t;
 
 // Target Types
+// NOTE: target_is_stm32() below is a RANGE check over STM32F1..STM32L4 —
+// any new member MUST be appended AFTER TARGET_STM32L4 (never inserted
+// between TARGET_STM32F1 and TARGET_STM32L4), or it silently becomes
+// "an STM32" everywhere target_is_stm32() gates behavior.
 typedef enum {
     TARGET_NONE = 0,
     TARGET_LPC,         // LPC2xxx (ARM7TDMI-S) — CRP word at 0x000001FC
@@ -57,6 +61,7 @@ typedef enum {
     TARGET_STM32F3,     // STM32F334 etc (Cortex-M4)
     TARGET_STM32F4,     // STM32F401/F429 etc (Cortex-M4)
     TARGET_STM32L4,     // STM32L451/L452 etc (Cortex-M4)
+    TARGET_BAT32,       // Cmsemicon BAT32G135 (Cortex-M0+) — read-only (see bat32_target.h)
 } target_type_t;
 
 // Helper to check if any STM32 family is selected
@@ -67,6 +72,11 @@ static inline bool target_is_stm32(target_type_t t) {
 // Helper to check if any LPC family is selected
 static inline bool target_is_lpc(target_type_t t) {
     return t == TARGET_LPC || t == TARGET_LPC_CM;
+}
+
+// Helper to check if the BAT32G135 is selected
+static inline bool target_is_bat32(target_type_t t) {
+    return t == TARGET_BAT32;
 }
 
 // STM32 flash controller register map (varies by family)

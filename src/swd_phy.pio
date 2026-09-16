@@ -1,0 +1,173 @@
+;
+; swd_phy.pio -- SWD physical layer for raiden-pico, on PIO2 (entirely free:
+; PIO0/PIO1 are both saturated by the glitch engine, see glitch.c/glitch.pio).
+;
+; The `swd_phy` program below is a direct port of `probe.pio` from
+; raspberrypi/debugprobe (https://github.com/raspberrypi/debugprobe),
+; retargeted from that project's PROBE_* naming to this one and stripped of
+; its multi-probe abstraction -- the command-word protocol (bit count +
+; SWDIO direction + jump target, `out pc, 5` dispatch) is unchanged, because
+; the bidirectional SWDIO turnaround it encodes is the one genuinely hard
+; part of a PIO SWD phy and debugprobe already gets it right. Credited in
+; README.md and CHANGELOG.md. Original license follows verbatim:
+;
+; -----------------------------------------------------------------------------
+; The MIT License (MIT)
+;
+; Copyright (c) 2021-2023 Raspberry Pi (Trading) Ltd.
+;
+; Permission is hereby granted, free of charge, to any person obtaining a copy
+; of this software and associated documentation files (the "Software"), to deal
+; in the Software without restriction, including without limitation the rights
+; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+; copies of the Software, and to permit persons to whom the Software is
+; furnished to do so, subject to the following conditions:
+;
+; The above copyright notice and this permission notice shall be included in
+; all copies or substantial portions of the Software.
+;
+; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+; THE SOFTWARE.
+; -----------------------------------------------------------------------------
+;
+; Every TX FIFO entry is either a command, or up to 32 bits of data.
+; Command format:
+;
+; | 13:9 |  8  |  7:0  |
+; | Cmd  | Dir | Count |
+;
+; Count is the number of bits to be transferred by this command, minus 1.
+; Dir is the output-enable for the SWDIO pin.
+; Cmd is the instruction address of the write_cmd or read_cmd label.
+;
+; write_cmd expects a second FIFO data entry; read_cmd does not, but pushes
+; its result to the RX FIFO.
+;
+; The SWCLK period is 4 PIO SM execution cycles -- see swd_phy_init() in
+; swd_phy.c for the clkdiv math.
+
+.program swd_phy
+.side_set 1 opt
+
+public write_cmd:
+public turnaround_cmd:                      ; alias of write_cmd -- swd_phy_turnaround()
+                                              ; uses this for the SWDIO-becomes-DRIVE case
+    pull
+write_bitloop:
+    out pins, 1             [1]  side 0x0   ; data changes on the falling edge...
+    jmp x-- write_bitloop   [1]  side 0x1   ; ...and is captured by the target on the rising edge
+.wrap_target
+public get_next_cmd:
+    pull                         side 0x0   ; SWCLK is low between commands
+    out x, 8                                ; bit count - 1
+    out pindirs, 1                          ; SWDIO direction for this command
+    out pc, 5                               ; jump to the command routine
+
+read_bitloop:
+    nop                                     ; matches the extra cycle write_bitloop
+                                            ; spends on its taken branch, so read and
+                                            ; write commands take the same time per bit
+public read_cmd:
+    in pins, 1               [1]  side 0x1   ; sampled by us on the rising edge
+    jmp x-- read_bitloop          side 0x0
+    push
+.wrap
+
+% c-sdk {
+static inline void swd_phy_gpio_claim(uint pin_swclk, uint pin_swdio) {
+    pio_gpio_init(pio2, pin_swclk);
+    pio_gpio_init(pio2, pin_swdio);
+    gpio_pull_up(pin_swdio);   // idle state is high, matches the bit-bang
+                                // path's swd_init() (SWDIO driven high)
+}
+
+static inline void swd_phy_gpio_release(uint pin_swclk, uint pin_swdio) {
+    gpio_deinit(pin_swclk);
+    gpio_disable_pulls(pin_swclk);
+    gpio_deinit(pin_swdio);
+    gpio_disable_pulls(pin_swdio);
+}
+
+static inline void swd_phy_program_init(PIO pio, uint sm, uint offset,
+                                         uint pin_swclk, uint pin_swdio,
+                                         float clkdiv) {
+    pio_sm_config c = swd_phy_program_get_default_config(offset);
+
+    sm_config_set_sideset_pins(&c, pin_swclk);
+    sm_config_set_out_pins(&c, pin_swdio, 1);
+    sm_config_set_set_pins(&c, pin_swdio, 1);
+    sm_config_set_in_pins(&c, pin_swdio);
+
+    // Both pins start as outputs (SWCLK always; SWDIO per swd_init()'s
+    // bit-bang equivalent -- the first real command corrects it if wrong).
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_swclk, 1, true);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_swdio, 1, true);
+
+    sm_config_set_out_shift(&c, true, false, 0);  // shift right, autopull off, LSB first
+    sm_config_set_in_shift(&c, true, false, 0);   // shift right, autopush off, LSB first
+    sm_config_set_clkdiv(&c, clkdiv);
+
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}
+
+; -----------------------------------------------------------------------------
+; swd_phy_nrst -- one-shot nRST release+delay sequencer for SWD RACE, on the
+; same PIO2 instance, a separate SM. See swd_phy_nrst_race() in swd_phy.c.
+;
+; 2 SM cycles = 1 microsecond (see swd_phy_nrst_init()'s clkdiv): each pass
+; through a `jmp !x, done` / `jmp x--, loop` pair costs exactly 1us, and the
+; `jmp !x` leg makes X=0 (0 extra microseconds) a legal, immediately-taken
+; exit rather than an underflow -- delay_us is honored exactly, no clamp or
+; rounding, 0 included.
+; -----------------------------------------------------------------------------
+
+.program swd_phy_nrst
+
+public nrst_start:
+    set pindirs, 1          ; drive nRST low (active-low, active-drive assert)
+    set pins, 0
+    set x, 10                ; tRSL >= 10us ([DS] Sec 6.6 p.49) -- fixed, not
+                              ; sourced from the FIFO
+hold_loop:
+    jmp !x, hold_done
+    jmp x--, hold_loop
+hold_done:
+    set pindirs, 0            ; release to hi-Z; the target's own pull-up
+                               ; (10kOhm, measured on this bench) restores
+                               ; VDD -- same electrical behavior as the
+                               ; bit-banged swd_nrst_release()
+    pull                       ; blocks here until swd_phy_nrst_race() pushes
+                               ; delay_us -- see the ordering note there
+    out x, 32
+delay_loop:
+    jmp !x, delay_done
+    jmp x--, delay_loop
+delay_done:
+    irq set 4                  ; PIO2-local IRQ 4: signals the race delay has
+                                ; elapsed and nRST has been released for
+                                ; exactly delay_us. Never touched by PIO0/1
+                                ; (per-instance flag space) or by the glitch
+                                ; engine's GLITCH_IRQ_NUM 0 on PIO0.
+spin:
+    jmp spin                   ; single-shot: stay parked here until the CPU
+                                ; explicitly re-arms (pio_sm_restart + exec
+                                ; jmp nrst_start) for the next race attempt
+
+% c-sdk {
+static inline void swd_phy_nrst_program_init(PIO pio, uint sm, uint offset,
+                                              uint pin_nrst, float clkdiv) {
+    pio_sm_config c = swd_phy_nrst_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, pin_nrst, 1);
+    // Pindir is driven entirely by `set pindirs` inside the program; start
+    // as input (released) to match the target's idle state.
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_nrst, 1, false);
+    sm_config_set_clkdiv(&c, clkdiv);
+    pio_sm_init(pio, sm, offset, &c);
+}
+%}

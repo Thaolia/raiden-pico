@@ -223,7 +223,7 @@ class TestDebug:
 
 class TestTargetType:
 
-    @pytest.mark.parametrize("target", ["LPC", "STM32F1", "STM32F3", "STM32F4", "STM32L4"])
+    @pytest.mark.parametrize("target", ["LPC", "STM32F1", "STM32F3", "STM32F4", "STM32L4", "BAT32"])
     def test_set_target_type(self, raiden, target):
         r = raiden.cmd(f"TARGET {target}")
         assert "OK" in r or target in r
@@ -232,6 +232,12 @@ class TestTargetType:
         raiden.cmd("TARGET STM32F1")
         r = raiden.cmd("STATUS", wait=2)
         assert "STM32F1" in r
+
+    def test_target_type_bat32_in_status(self, raiden):
+        raiden.cmd("TARGET BAT32")
+        r = raiden.cmd("STATUS", wait=2)
+        assert "BAT32" in r
+        raiden.cmd("TARGET STM32F1")  # restore a benign default for later tests
 
     def test_target_timeout_roundtrip(self, raiden):
         raiden.cmd("TARGET TIMEOUT 100")
@@ -259,6 +265,27 @@ class TestTargetType:
     def test_target_bad_subcommand(self, raiden):
         r = raiden.cmd("TARGET FOOBAR")
         assert "ERROR" in r
+
+    def test_target_bat99_unknown_rejected(self, raiden):
+        # Not a valid target and not an unambiguous prefix of BAT32 or
+        # anything else — must error, not silently no-op.
+        r = raiden.cmd("TARGET BAT99")
+        assert "ERROR" in r
+
+    def test_target_bat32_swd_opt_no_wiring_fails_at_connect(self, raiden):
+        """No target is wired in config_none, so SWD OPT/RDP/FLASH under
+        TARGET BAT32 fail at the auto-connect stage (same as they would
+        for any other target type) rather than reaching the BAT32-specific
+        branches — this only confirms the command fails cleanly, not
+        silently. The BAT32-specific refusal text (RDP register / FLASH
+        read-only) needs a live SW-DP to reach and is covered under
+        --config=swd in test_config_swd.py.
+        """
+        raiden.cmd("TARGET BAT32")
+        assert "ERROR" in raiden.cmd("SWD OPT", wait=2)
+        assert "ERROR" in raiden.cmd("SWD RDP", wait=2)
+        assert "ERROR" in raiden.cmd("SWD FLASH ERASE 0", wait=2)
+        raiden.cmd("TARGET STM32F1")  # restore a benign default
 
 
 # ── Glitch execution ─────────────────────────────────────────
@@ -430,6 +457,87 @@ class TestSWDSpeed:
         raiden.cmd("SWD SPEED 1")
 
 
+# ── SWD PHY (bit-bang vs. PIO physical layer) ─────────
+# SWD PHY PIO only records mode + frequency (the PIO program itself is
+# claimed lazily inside swd_connect_ex()) -- safe with no target wired,
+# same reasoning as SWD SPEED being pure config. Every test restores
+# BITBANG at the end so it doesn't leak into later tests/modules.
+
+class TestSWDPhy:
+
+    def test_phy_query_reports_selected_mode(self, raiden):
+        # Sets the mode explicitly rather than asserting the boot default:
+        # the default is only observable on a freshly-booted device, and any
+        # earlier test (or manual session) that selected PIO would otherwise
+        # make this fail for a reason that has nothing to do with the code.
+        raiden.cmd("SWD PHY BITBANG")
+        assert "BITBANG" in raiden.cmd("SWD PHY")
+        raiden.cmd("SWD PHY PIO 2500")
+        assert "PIO" in raiden.cmd("SWD PHY")
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_phy_unknown_mode(self, raiden):
+        assert "ERROR" in raiden.cmd("SWD PHY WIBBLE")
+
+    # No test here for "SWD PHY PIO with no khz and none ever configured" --
+    # phy_khz_last is a static that only resets on reboot, so that specific
+    # refusal (swd_set_phy_mode() returning false) is only deterministically
+    # true right after flashing/rebooting, not reliably reproducible against
+    # a live device that another test in this run may have already put into
+    # PIO mode. test_phy_pio_zero_khz below covers the CLI-level "0 is
+    # never valid" rejection, which is the reliably-testable half of this.
+
+    def test_phy_pio_bad_khz(self, raiden):
+        assert "ERROR" in raiden.cmd("SWD PHY PIO notanumber")
+
+    def test_phy_pio_zero_khz(self, raiden):
+        assert "ERROR" in raiden.cmd("SWD PHY PIO 0")
+
+    def test_phy_bitbang_takes_no_arg(self, raiden):
+        assert "ERROR" in raiden.cmd("SWD PHY BITBANG 5")
+
+    def test_phy_pio_set_and_query(self, raiden):
+        r = raiden.cmd("SWD PHY PIO 2500")
+        assert "OK" in r and "2500" in r
+        r = raiden.cmd("SWD PHY")
+        assert "PIO" in r and "2500" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_phy_pio_reuses_last_khz(self, raiden):
+        raiden.cmd("SWD PHY PIO 2000")
+        raiden.cmd("SWD PHY BITBANG")
+        r = raiden.cmd("SWD PHY PIO")   # no khz given -- reuses 2000
+        assert "OK" in r and "2000" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+
+# ── SWD BENCH. Exempted from auto-connect (see command_parser.c) so it can
+# run here whether or not a target happens to be wired -- config_none means
+# "needs no PARTICULAR wiring", not "guaranteed nothing attached". The
+# invariant that holds either way: it answers promptly, reports a
+# microsecond figure, and never hangs. Asserting failure specifically was
+# wrong -- it broke the moment a working BAT32 was on the bench.
+
+class TestSWDBench:
+
+    def test_bench_answers_with_a_timing(self, raiden):
+        raiden.cmd("SWD PHY BITBANG")
+        r = raiden.cmd("SWD BENCH", wait=1.5)
+        assert "SWD BENCH" in r and "us" in r
+        assert ("OK:" in r) or ("ERROR" in r)
+
+    def test_bench_reports_phase_split_on_success(self, raiden):
+        """If a target IS attached, the per-phase split must be present --
+        that breakdown is the whole point of the command (a bare total sent
+        an optimisation attempt after the wrong thing twice, see v0.10)."""
+        raiden.cmd("SWD PHY BITBANG")
+        r = raiden.cmd("SWD BENCH", wait=1.5)
+        if "OK:" not in r:
+            pytest.skip("No SWD target attached; nothing to split")
+        for field in ("connect=", "ahb=", "read="):
+            assert field in r, f"SWD BENCH success line missing {field}"
+
+
 # ── ChipSHOUTER command guardrails (error paths) ─────────────
 # These reject bad input in the firmware BEFORE anything is sent to the
 # ChipSHOUTER, so they're safe with no CS connected (no arm/fire). Happy paths
@@ -442,7 +550,10 @@ class TestCsCommands:
 
     def test_cs_voltage_out_of_range(self, raiden):
         r = raiden.cmd("CS VOLTAGE 999")          # > 500V max
-        assert "ERROR" in r and "range" in r.lower()
+        if _console_owns_uart0(raiden):
+            assert "ERROR" in r and "UART0" in r
+        else:
+            assert "ERROR" in r and "range" in r.lower()
 
     def test_cs_voltage_too_low(self, raiden):
         assert "ERROR" in raiden.cmd("CS VOLTAGE 100")   # < 150V min
@@ -452,13 +563,98 @@ class TestCsCommands:
 
     def test_cs_pulse_out_of_range(self, raiden):
         r = raiden.cmd("CS PULSE 50")             # < 80ns min
-        assert "ERROR" in r and "range" in r.lower()
+        if _console_owns_uart0(raiden):
+            assert "ERROR" in r and "UART0" in r
+        else:
+            assert "ERROR" in r and "range" in r.lower()
 
     def test_cs_pulse_garbage(self, raiden):
         assert "ERROR" in raiden.cmd("CS PULSE xyz")
 
     def test_cs_trigger_bad_polarity(self, raiden):
         assert "ERROR" in raiden.cmd("CS TRIGGER HW BOGUS")
+
+
+# ── SWD RACE (reset-release race) — error paths only. ─────────
+# The happy path (an actual connect attempt) drives nRST + target power
+# via target_power_ensure_on(), so it lives in test_config_swd.py behind
+# --config=swd, same gating as SWD CONNECT's own auto-power test. Every
+# case below is validated BEFORE any hardware is touched (see the ordering
+# comment on the SWD RACE handler in command_parser.c) — safe here.
+
+class TestSWDRaceErrors:
+
+    def test_race_requires_phy_pio(self, raiden):
+        raiden.cmd("SWD PHY BITBANG")
+        r = raiden.cmd("SWD RACE")
+        assert "ERROR" in r and "PHY" in r
+        raiden.cmd("SWD PHY BITBANG")  # restore default (no-op, already BITBANG)
+
+    def test_race_bad_delay(self, raiden):
+        raiden.cmd("SWD PHY PIO 2500")
+        r = raiden.cmd("SWD RACE notanumber")
+        assert "ERROR" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_race_sweep_missing_args(self, raiden):
+        raiden.cmd("SWD PHY PIO 2500")
+        r = raiden.cmd("SWD RACE SWEEP 100")
+        assert "ERROR" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_race_sweep_bad_range(self, raiden):
+        raiden.cmd("SWD PHY PIO 2500")
+        r = raiden.cmd("SWD RACE SWEEP 100 0 10")   # end < start
+        assert "ERROR" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_race_sweep_zero_step(self, raiden):
+        raiden.cmd("SWD PHY PIO 2500")
+        r = raiden.cmd("SWD RACE SWEEP 0 100 0")
+        assert "ERROR" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_race_sweep_bad_shots_keyword(self, raiden):
+        raiden.cmd("SWD PHY PIO 2500")
+        r = raiden.cmd("SWD RACE SWEEP 0 100 10 WIBBLE 3")
+        assert "ERROR" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_race_sweep_missing_shots_value(self, raiden):
+        raiden.cmd("SWD PHY PIO 2500")
+        r = raiden.cmd("SWD RACE SWEEP 0 100 10 SHOTS")
+        assert "ERROR" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+    def test_race_sweep_too_large(self, raiden):
+        raiden.cmd("SWD PHY PIO 2500")
+        r = raiden.cmd("SWD RACE SWEEP 0 100000000 1")   # way over MAX_POINTS
+        assert "ERROR" in r
+        raiden.cmd("SWD PHY BITBANG")
+
+
+# ── SET/GET value validation (parse_u32, not atoi) ────────────
+
+class TestSetValueValidation:
+
+    def test_set_pause_garbage_errors(self, raiden):
+        r = raiden.cmd("SET PAUSE notanumber")
+        assert "ERROR" in r
+
+    def test_set_width_garbage_does_not_apply(self, raiden):
+        raiden.cmd("SET WIDTH 150")
+        r = raiden.cmd("SET WIDTH xyz")
+        assert "ERROR" in r
+        # A rejected SET must not silently overwrite the old value with 0
+        # (the old atoi() behavior) — WIDTH should still read 150.
+        r2 = raiden.cmd("GET WIDTH")
+        assert "150" in r2
+
+    def test_set_pause_hex_accepted(self, raiden):
+        raiden.cmd("SET PAUSE 0x100")
+        r = raiden.cmd("GET PAUSE")
+        assert "256" in r
+        raiden.cmd("SET PAUSE 1000")  # restore a benign default
 
 
 # ── Prefix matching ──────────────────────────────────────────

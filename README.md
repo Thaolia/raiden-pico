@@ -302,10 +302,15 @@ Single-run traces contain large periodic current dips (~every 4-5 seconds) unrel
 
 Raiden Pico includes built-in support for entering bootloader mode on common microcontrollers.
 
-**`TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4>`** - Set target microcontroller type
+**`TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BAT32>`** - Set target microcontroller type
 - Configures bootloader entry protocol
 - `LPC` - NXP LPC series (ISP protocol)
 - `STM32` - STMicroelectronics STM32 series
+- `BAT32` - Cmsemicon BAT32G135 (Cortex-M0+) — **read-only**: no UART ISP bootloader
+  (undocumented on this part) and no flash write/erase path. Sets up the memory map for
+  `SWD READ FLASH|SRAM` and enables the BAT32-specific decode in `SWD OPT`. See
+  `SWD RACE` below for the reset-release race this target needs (its SW-DP does not
+  answer while `RESETB` is held low, so `SWD CONNECTRST` does not work on it).
 
 **`TARGET BOOTLOADER [baud] [crystal_khz]`** - Enter bootloader
 - Initialize target UART and enter bootloader mode
@@ -424,7 +429,39 @@ Built-in UART control for NewAE ChipSHOUTER EMFI tool.
 
 #### SWD Debug Interface
 
-Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting, reading/writing registers and memory, and STM32-specific operations like RDP readout and option byte inspection.
+SWD (Serial Wire Debug) for ARM Cortex-M targets, over two selectable physical
+layers (`SWD PHY`, default bit-banged GPIO): supports connecting, reading/writing
+registers and memory, STM32-specific operations like RDP readout and option byte
+inspection, and read-only BAT32G135 option-byte decoding.
+
+**`SWD PHY [BITBANG|PIO [<khz>]]`** - Get/set the physical layer
+- `BITBANG` (default): the original bit-banged GPIO driver, timed by `SWD SPEED`.
+  `SPEED 0` (max) mis-samples on a flying-wire bench with no series resistors —
+  `ACK=0x7` and a `DPIDR` shifted left by one bit, indistinguishable on the
+  surface from a genuinely SWD-disabled target. Slow down (`SPEED 1-8`) before
+  concluding a target is protected. See §0bis of `07_BAT32G135_FAULTYCAT.md`.
+- `PIO`: PIO2 SM0, adapted from [raspberrypi/debugprobe](https://github.com/raspberrypi/debugprobe)'s
+  `probe.pio` (MIT license) — uniform, correctly-sampled edges at a chosen
+  frequency, no `SPEED 0` failure mode. Required by `SWD RACE` (see below).
+  `<khz>` is required the first time PIO is selected; omit it later to reuse
+  the last frequency. Switching either direction forces a reconnect.
+- PIO2 is otherwise unused by this firmware (PIO0/PIO1 are both saturated by
+  the glitch engine) — the split is `swd.c` (protocol) / `swd_phy.c` +
+  `swd_phy.pio` (PIO2 physical layer) / `swd.c`'s bit-bang fallback.
+
+**`SWD BENCH`** - Time a fast connect + AHB-AP bring-up + 2-word read
+- The same sequence `SWD RACE` runs on each attempt, without touching nRST —
+  a before/after measurement of what a physical-layer or speed change actually
+  bought. Reports elapsed microseconds at whatever `SWD PHY`/`SWD SPEED` is
+  currently active, **broken down by phase** (`connect=` line reset +
+  JTAG-to-SWD + DPIDR, `ahb=` power-up handshake + AP probe, `read=` CSW/TAR
+  + the DRW reads). The split exists because a whole-number total sent an
+  earlier optimisation attempt after the wrong thing twice — measure the
+  phases before theorising.
+- Measured on a BAT32G135 (v0.10): BITBANG `SPEED 4` 8 755 us · PIO 2500 kHz
+  531 us · PIO 8000 kHz 249 us (connect 87 / ahb 91 / read 71).
+- Like every other `SWD` command, it leaves the target connected afterward
+  (debug domain powered, AHB-AP up) — it's a timing probe, not read-only.
 
 **`SWD CONNECT`** - Connect to target via SWD
 - Performs line reset + JTAG-to-SWD switch sequence
@@ -434,6 +471,32 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 **`SWD CONNECTRST`** - Connect under reset
 - Holds nRST, connects via SWD, halts core, releases nRST
 - Required for modifying option bytes on RDP-protected targets
+- Needs the target's SW-DP to still answer *while nRST is held low* — some parts
+  (e.g. BAT32G135: SWDIO/SWCLK are high-impedance during an external reset or POR,
+  per its user manual) don't. For those, use `SWD RACE` instead — same goal, opposite
+  timing: it releases nRST *first*, then races to connect.
+
+**`SWD RACE [<delay_us>]`** - Reset-release race
+- Asserts nRST, releases it, waits **exactly** `delay_us` (no clamping, no implicit
+  compensation), then races to connect + bring up the AHB-AP + read the reset vector
+  (`0x00000000`) before the target's own firmware can lock SWD (e.g. by writing a
+  runtime SWD-disable bit — `DBGSTOPCR.SWDIS` on the BAT32G135). This is a pure
+  timing race, not a fault injection.
+- Requires `SWD PHY PIO` first (v0.10+). Bit-banged clocking — at any `SWD SPEED`,
+  including 0 (see `SWD PHY` above) — either dwarfs the race window or mis-samples
+  it outright.
+- Prints one of `no_dp` / `dp_only` / `mem_blocked` / `perturbed` / `SUCCESS`. The
+  `SUCCESS` plausibility check (SP inside the target's SRAM, PC inside its code
+  flash with the Thumb bit set) only activates when `TARGET BAT32` is selected —
+  otherwise every non-blocked read reports `perturbed`.
+- On `SUCCESS` the target is left **powered and connected** — dump immediately
+  (`SWD READ FLASH ...`), don't reset or power-cycle first (Level 0 on the
+  BAT32G135 does not survive the next reset).
+
+**`SWD RACE SWEEP <start_us> <end_us> <step_us> [SHOTS <n>]`** - Sweep the race delay
+- Bounded to 200000 delay points x 1000 shots; stops immediately on the first
+  `SUCCESS` (see above); aborts on any pending keypress. Prints throttled progress
+  and a final summary. Example: `SWD RACE SWEEP 0 2000 1 SHOTS 3`.
 
 **`SWD IDCODE`** - Identify connected target
 - Reads DPIDR, CPUID, and STM32 debug ID code
@@ -452,12 +515,51 @@ Bit-banged SWD (Serial Wire Debug) for ARM Cortex-M targets. Supports connecting
 - Examples: `SWD FILL SRAM DEADBEEF 16`, `SWD FILL 08000000 CAFEF00D 8 ERASE`
 
 **`SWD FLASH ERASE <page>`** - Erase a flash page
+- STM32 only — under `TARGET BAT32` it redirects to `SWD BAT32` (below), whose
+  flash controller sequence is transcribed from the vendor driver
+
+**`SWD BAT32 <op> ...`** - BAT32G135 flash controller (writes need `CONFIRM`)
+- `PROGRAM <addr> <byte> CONFIRM` · `WRITE <addr> <hex> CONFIRM` (256 B max) ·
+  `PATTERN <addr> <len> CONFIRM` (blank pages only) · `ARM CONFIRM` (OCDEN →
+  0xC3 = protection Level 1) · `DISARM CONFIRM` · `CHIPERASE CONFIRM` ·
+  `SECTORERASE <addr> CONFIRM`
+- Programming clears bits only (1→0); going 0→1 needs an erase
+- ★ **`CHIPERASE` erases the code flash only.** Measured 2026-09-02: after a
+  chip erase reporting success, the data flash at `0x500000` was byte-identical
+  to its pre-erase content. Aiming the trigger write at `0x500000` changes
+  nothing — that array is outside `FLERMD=0x08`. Consequence: **escaping Level 1
+  by chip erase preserves the data flash**, pairing included.
+- ★ **`SECTORERASE` is the only way to blank the data flash** (vendor
+  `FLERMD=0x10`). `<addr>` = any address in the sector. The data-flash sector is
+  **512 bytes**, so the 1.5 KB array takes three: `0x500000`, `0x500200`,
+  `0x500400`.
+
+**`SWD BAT32 RAMREAD <addr> [words]`** - Read flash **through the target core**
+- The Level 1 bypass: at Level 1 the *debugger* may not read flash, but the core
+  may — it executes from it. This halts the core, drops a 16-byte Thumb copier
+  into SRAM at `0x20000000`, points `PC` at it with `r0`=source,
+  `r1`=`0x20000020`, `r2`=word count, resumes, and reads the buffer back once
+  the trailing `BKPT` re-halts the core.
+- Word-aligned address; 1-1024 words (4 KB) per pass, default 4
+- Read-only on flash, so no `CONFIRM` — but it **overwrites target SRAM
+  `0x20000000-0x2000101F`**, which is where `.data` copied from flash at boot
+  lives. At Level 1, dump SRAM *before* the first `RAMREAD`.
+- Validated at Level 0: 64 KB of code flash and 1.5 KB of data flash come back
+  byte-identical to `SWD READ` (35 s for the RAMREAD pass alone at `SWD SPEED
+  4`; 70 s for the two-path comparison, `scripts/bat32_ramread_compare.py`).
+  **Not yet tried at Level 1**, which is the only case it exists for.
+- A failure says which step failed — SRAM not writable, register write refused,
+  core locked up, or halted somewhere other than the payload's `BKPT`
 
 **`SWD OPT`** - Read option bytes
 - Displays all option registers for the selected STM32 family
+- Under `TARGET BAT32`: decodes `OCDEN`/`OCDM`/`BTEN` (both option-byte clusters,
+  including the boot-swap mirror) and `DBGSTOPCR.SWDIS`, and prints the deduced
+  protection level (Level 0/1/2, per the official OCDEN/OCDM truth table)
 
 **`SWD RDP`** - Read RDP (readout protection) level
-- Requires TARGET set to an STM32 family
+- Requires TARGET set to an STM32 family — refused under `TARGET BAT32` (it has no
+  RDP register; its protection model is the OCDEN/OCDM option bytes, use `SWD OPT`)
 - Returns level 0, 1, or 2
 
 **`SWD RDP SET <0|1>`** - Set RDP level
@@ -664,6 +766,10 @@ The saved threshold (0.81V — the lowest still-retaining row) is what gets pass
 | GP18 | SWDIO | SWD data (payload upload) |
 | GP26 | VDD | ADC voltage monitor (via divider) |
 | GND | GND | Common ground |
+
+GP15/17/18 are SIO (plain GPIO) by default; when `SWD PHY PIO` is active, GP17/18
+are PIO2 SM0-driven continuously, and GP15 is briefly PIO2 SM1-driven only for the
+duration of an `SWD RACE` attempt (SIO the rest of the time) — see `SWD PHY` above.
 
 #### How it works
 
@@ -876,6 +982,55 @@ three pins are re-tasked (they are mutually exclusive with INTERNAL power-source
 GP2 stays the polarity-aware glitch/trigger output throughout, so an external glitcher
 (e.g. ChipSHOUTER) and the crowbar gate can be driven from the same trigger.
 
+#### Wiring the crowbar board — GP11 is a gate, not a switch
+
+GP11 drives a **MOSFET gate**. It is not a wire you can run straight to the rail, and the
+firmware's safe idle does **not** cover the whole picture. Reference design (AO3400A,
+SOT-23 — pin 1 = gate, pin 2 = source, pin 3 = drain):
+
+```
+  3V3 ─ C_res 100uF//100nF ─[ R_series 4R3 ]──┬────────► target VDD
+                                              │
+                                              ├──[ 1k ]──► GP26 (ADC0)
+                                              ├──[ 1k ]──► GP27 (ADC1)
+                                              │
+                                         [ R_damp ]
+                                              │
+                                        pin 3 = DRAIN
+  GP11 ──[ 0R strap ]──┬──── pin 1 = GATE ───┤ AO3400A
+                       │                      └ pin 2 = SOURCE
+                  [ R_pd 1k ]                       │
+                       │                            │
+                       └────────────────────────────┴──► GND (single star ground)
+```
+
+- **`R_pd` = 1 kΩ, gate-to-source, mounted on the MOSFET board — mandatory.** `V_GS(th)`
+  min is 0.65 V, and outside firmware control (bootrom, BOOTSEL, UF2 reflash, crash, or an
+  unplugged gate wire) GP11 is an **input** — where **erratum RP2350-E9** injects up to
+  120 µA. The value is bounded by `120 µA × R_pd < V_GS(th)`, **not** by `V_IL`: 1 kΩ gives
+  0.12 V, while the usual 10 kΩ gives 1.2 V and the stock 8.2 kΩ E9 workaround gives 0.98 V
+  — both above threshold. A floating gate is a **dead short across the rail**.
+- **No gate series resistor.** The pad (~50 Ω) already over-damps the line; anything above
+  ~10 Ω only slows the edge. Gate rise is `τ` ≈ 33 ns at the 12 mA drive strength that
+  `target_init()` sets for the whole GP10/11/12 group.
+- **`R_damp` in series with the drain** — required with a low-`R_DS(on)` part. At 19 mΩ the
+  discharge mesh is heavily under-damped: the rail rings to **−2.4 V** and the peak current
+  is **~8 A** (set by `V/Z0` of the LC mesh, not by the series resistor). Use
+  `R_damp ≈ √(L_loop / C_residual)` — 0.15 Ω at 10 µF, 0.47 Ω at 1 µF, 1.2 Ω at 100 nF —
+  and pick the value **after** measuring `C_residual`, not before.
+- **1 kΩ in series with GP26/GP27.** They sit galvanically on the glitch node, which goes
+  below 0 V during the pulse; RP2350 I/O absolute maximum is −0.3 V.
+- **GP11 needs its own line.** Left strapped to the GP10/GP12 harness it fights GP10 (see
+  `tests/test_power_mode.py`).
+- Bring-up order, scope acceptance criteria and the derivation of every number above:
+  `TPLink_Tapo/08_BANC_FAULTYCAT_RAIDEN.md` §4, in the parent repository.
+
+⚠ **`WIDTH` floor in this mode.** GP2 only carries an *edge*, so `SET WIDTH 1` is fine
+there — but in EXTERNAL mode GP11 carries the **real pulse width**, and two floors stack:
+the gate needs ~15 cycles to reach full enhancement, and `SET WIDTH` is not monotonic
+between 6 and 10 (see **Glitch Width Range** under Technical Details). Start width sweeps
+at **≥ 20 cycles**.
+
 ### SWD/JTAG Debug Interface
 
 - **GPIO 15** - nRST / TRST (shared with Target Reset)
@@ -955,7 +1110,11 @@ Then rebuild and reflash the firmware.
 - **System Clock**: 150 MHz
 - **Timing Resolution**: 6.67 ns (1 clock cycle)
 - **UART Baud Rates**: Up to 921600 (configurable)
-- **Glitch Width Range**: 1 cycle to 2^32 cycles (6.67ns to 28.6 seconds)
+- **Glitch Width Range**: the *delivered* HIGH time is **`WIDTH + 3` cycles** below 6 and
+  **`WIDTH − 2`** above (`glitch.c:376-378` subtracts 5, `glitch.pio:92-104` adds a fixed
+  3), so the real minimum is **3 cycles ≈ 20 ns**, not one cycle. ⚠ The mapping is **not
+  monotonic**: `WIDTH` 6…9 deliver *less* than `WIDTH` 5, and `WIDTH` 10 merely equals it.
+  Upper bound is 2^32 cycles (~28.6 s) — `SET WIDTH` is unclamped.
 - **Trigger Latency**: ~18 ticks (~120ns) from trigger detection to glitch output
   - This latency is automatically compensated in the PAUSE command
   - For PAUSE values >= 18, 18 ticks are subtracted to account for trigger processing

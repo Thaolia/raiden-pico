@@ -130,9 +130,25 @@ class RaidenClient:
         self.ser.reset_input_buffer()
         self.ser.write(f"{command}\r\n".encode())
         print(f"\n>>> {command}")
-        time.sleep(wait)
         data = b""
-        # Drain all available data — keep reading until 0.5s of silence
+        # Drain WHILE waiting, never sleep blind.
+        #
+        # A bare time.sleep(wait) lets the device's USB CDC TX buffer fill with
+        # nobody reading; stdio_usb then hits PICO_STDIO_USB_STDOUT_TIMEOUT_US
+        # and DROPS the rest — silently, mid-line. Measured on HELP (2026-09-05):
+        # the firmware emits 7828 bytes, a blind 5 s sleep received 4888 of them
+        # (cut inside "== ADC ==", losing Trace/GRBL/SWD/JTAG/General), while
+        # draining during the same window receives all 7840 and all 15 sections.
+        # That is what made test_help_has_sections fail — the harness, not the
+        # firmware.
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            n = self.ser.in_waiting
+            if n:
+                data += self.ser.read(n)
+            else:
+                time.sleep(0.02)
+        # Then keep reading until 0.5s of silence (unchanged tail behaviour)
         empty_count = 0
         while empty_count < 5:
             n = self.ser.in_waiting

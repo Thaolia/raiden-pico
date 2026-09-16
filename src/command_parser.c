@@ -5,6 +5,7 @@
 #include "lpc_target.h"
 #include "grbl.h"
 #include "swd.h"
+#include "bat32_target.h"
 #include "jtag.h"
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
@@ -239,6 +240,28 @@ static bool is_mem_alias(const char *name) {
 static bool resolve_mem_alias(const char *name, uint32_t *addr, uint32_t *size_out) {
     extern target_type_t target_get_type(void);
     target_type_t tt = target_get_type();
+
+    // BAT32G135: FLASH/SRAM map to its code flash / SRAM. It has no boot
+    // ROM (§5.2 of the doc: always boots from 0x00000000, no ISP). Its
+    // data flash (0x00500000, holds OCDM/BTEN) and UID have no alias here
+    // — read them by raw address, same as the doc's own raiden-pico
+    // scripts do (SWD READ 0x00500000 ...).
+    if (target_is_bat32(tt)) {
+        const bat32_target_info_t *info = bat32_get_target_info(tt);
+        if (strcmp(name, "FLASH") == 0) {
+            *addr = info->code_flash_base;
+            if (size_out) *size_out = info->code_flash_size;
+        } else if (strcmp(name, "SRAM") == 0) {
+            *addr = info->sram_base;
+            if (size_out) *size_out = info->sram_size;
+        } else {
+            uart_cli_send("ERROR: BAT32G135 has no boot ROM (BOOTROM alias not applicable) "
+                          "-- use a raw address for data flash (0x00500000) or UID (0x0050084C)\r\n");
+            return false;
+        }
+        return true;
+    }
+
     if (!target_is_stm32(tt)) {
         if (!swd_auto_detect_target()) {
             uart_cli_send("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");
@@ -292,15 +315,16 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TARGET") == 0) {
-            const char *target_subcmds[] = {"LPC", "LPC2", "LPC17", "STM32F1", "STM32F3", "STM32F4", "STM32L4",
+            const char *target_subcmds[] = {"LPC", "LPC2", "LPC17", "STM32F1", "STM32F3", "STM32F4", "STM32L4", "BAT32",
                                               "BOOT0", "BOOT1", "BOOTLOADER", "SYNC", "SEND", "RESPONSE", "RESET", "TIMEOUT", "POWER", "GLITCH", "BL"};
-            if (!match_and_replace(&parts->parts[1], target_subcmds, 18, "TARGET sub-command")) {
+            if (!match_and_replace(&parts->parts[1], target_subcmds, 19, "TARGET sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 16, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "RACE",
+                                          "PHY", "BENCH", "BAT32"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 20, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -393,9 +417,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("STATUS                 - Show current status\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Target Control ==\r\n");
-        uart_cli_send("TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4> - Set target type\r\n");
+        uart_cli_send("TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BAT32> - Set target type\r\n");
         uart_cli_send("                       LPC/LPC2 = LPC2xxx ARM7 (CRP@0x1FC)\r\n");
         uart_cli_send("                       LPC17    = LPC Cortex-M family (CRP@0x2FC)\r\n");
+        uart_cli_send("                       BAT32    = Cmsemicon BAT32G135, Cortex-M0+ (read-only)\r\n");
         uart_cli_send("TARGET BOOT0 [HIGH|LOW]  - Set BOOT0 pin (GP13)\r\n");
         uart_cli_send("TARGET BOOT1 [HIGH|LOW]  - Set BOOT1 pin (GP14)\r\n");
         uart_cli_send("TARGET BOOTLOADER [baud] [crystal_khz] - Enter bootloader\r\n");
@@ -481,7 +506,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("SWD REGS               - Read core registers\r\n");
         uart_cli_send("SWD RESET [ms|HOLD|RELEASE] - Target reset via nRST (default 100ms)\r\n");
         uart_cli_send("SWD SETREG <reg> <val> - Write core register\r\n");
-        uart_cli_send("SWD SPEED [us]         - Get/set clock delay (0=max, def 1)\r\n");
+        uart_cli_send("SWD SPEED [us]         - Get/set BITBANG clock delay (0=max, def 1)\r\n");
+        uart_cli_send("SWD PHY [BITBANG|PIO [<khz>]] - Get/set physical layer (def BITBANG)\r\n");
+        uart_cli_send("SWD BENCH              - Time a fast connect+AHB-AP+read\r\n");
+        uart_cli_send("SWD RACE [<delay_us>] / RACE SWEEP ... - Reset-release race (needs PHY PIO)\r\n");
         uart_cli_send("SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== JTAG Debug Interface (TCK=17, TMS=18, TDI=19, TDO=20, RTCK=21, TRST=15) ==\r\n");
@@ -594,6 +622,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (target_is_stm32(target_type)) {
             const stm32_target_info_t *info = stm32_get_target_info(target_type);
             target_type_str = info ? info->name : "STM32";
+        } else if (target_is_bat32(target_type)) {
+            const bat32_target_info_t *info = bat32_get_target_info(target_type);
+            target_type_str = info ? info->name : "BAT32";
         }
         uart_cli_printf("Type:         %s\r\n", target_type_str);
         if (target_get_power_mode() == POWER_MODE_EXTERNAL) {
@@ -709,7 +740,12 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("       VMIN value is millivolts (0 = disabled)\r\n");
             goto api_response;
         } else {
-            uint32_t value = atoi(parts->parts[2]);
+            uint32_t value;
+            if (!parse_u32(parts->parts[2], 0, &value)) {
+                api_error_printf("ERROR: Invalid value '%s' for SET %s (expected decimal or "
+                                  "0x-prefixed hex, max 32-bit)\r\n", parts->parts[2], parts->parts[1]);
+                goto api_response;
+            }
 
             if (strcmp(parts->parts[1], "PAUSE") == 0) {
                 glitch_set_pause(value);
@@ -957,9 +993,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP27 - ADC Shunt Current Monitor (timing measurement)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Debug Interface (SWD/JTAG) ==\r\n");
-        uart_cli_send("GP15 - nRST / TRST (shared with Target Reset)\r\n");
-        uart_cli_send("GP17 - SWCLK / TCK\r\n");
-        uart_cli_send("GP18 - SWDIO / TMS\r\n");
+        uart_cli_send("GP15 - nRST / TRST (shared with Target Reset; briefly PIO2 SM1-driven\r\n");
+        uart_cli_send("       during SWD RACE, SIO the rest of the time)\r\n");
+        uart_cli_send("GP17 - SWCLK / TCK (PIO2 SM0-driven when SWD PHY PIO is active)\r\n");
+        uart_cli_send("GP18 - SWDIO / TMS (PIO2 SM0-driven when SWD PHY PIO is active)\r\n");
         uart_cli_send("GP19 - TDI (JTAG only)\r\n");
         uart_cli_send("GP20 - TDO (JTAG only)\r\n");
         uart_cli_send("GP21 - RTCK (JTAG adaptive clocking, optional)\r\n");
@@ -1055,7 +1092,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         extern void target_reset_config(uint8_t pin, uint32_t period_ms, bool active_high);
 
         if (parts->count < 2) {
-            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
+            uart_cli_send("ERROR: Usage: TARGET <LPC|LPC2|LPC17|STM32F1|STM32F3|STM32F4|STM32L4|BAT32|BOOTLOADER|SYNC|SEND|RESPONSE|RESET|TIMEOUT|POWER>\r\n");
             goto api_response;
         }
 
@@ -1078,6 +1115,10 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "STM32L4") == 0) {
             target_set_type(TARGET_STM32L4);
             uart_cli_send("OK: Target type set to STM32L4 (Cortex-M4, 256KB flash)\r\n");
+        } else if (strcmp(parts->parts[1], "BAT32") == 0) {
+            target_set_type(TARGET_BAT32);
+            uart_cli_send("OK: Target type set to BAT32G135 (Cortex-M0+, 64KB code flash + 1.5KB data "
+                          "flash) -- read-only support: SWD READ FLASH|SRAM, SWD OPT, SWD RACE\r\n");
         } else if (strcmp(parts->parts[1], "BOOT0") == 0) {
             gpio_init(PIN_BOOT0);
             gpio_set_dir(PIN_BOOT0, GPIO_OUT);
@@ -2144,23 +2185,35 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD READ <addr> [n]      - Read n words (hex dump)\r\n");
             uart_cli_send("  SWD READ <region> [n]    - Read FLASH|SRAM|BOOTROM (default: full)\r\n");
             uart_cli_send("  SWD READ DP|AP <addr>    - Read debug/access port register\r\n");
+            uart_cli_send("  SWD RACE [<delay_us>]    - One reset-release SWD race attempt\r\n");
+            uart_cli_send("  SWD RACE SWEEP <start_us> <end_us> <step_us> [SHOTS <n>]\r\n");
+            uart_cli_send("                            - Sweep the race delay, stop on first SUCCESS\r\n");
             uart_cli_send("  SWD REGS                 - Read core registers (r0-r15, xPSR)\r\n");
             uart_cli_send("  SWD RESET [ms|HOLD|RELEASE] - Target reset via nRST (default 100ms)\r\n");
             uart_cli_send("  SWD RESUME               - Resume target core\r\n");
             uart_cli_send("  SWD SETREG <reg> <val>   - Write core register (r0-r12,sp,lr,pc,...)\r\n");
-            uart_cli_send("  SWD SPEED [us]               - Get/set clock delay (0=max, default 1)\r\n");
+            uart_cli_send("  SWD SPEED [us]               - Get/set BITBANG clock delay (0=max, default 1)\r\n");
+            uart_cli_send("  SWD PHY [BITBANG|PIO [<khz>]] - Get/set physical layer (default BITBANG)\r\n");
+            uart_cli_send("  SWD BENCH                 - Time a fast connect+AHB-AP+read at the current phy\r\n");
             uart_cli_send("  SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
             uart_cli_send("  SWD WRITE DP|AP <addr> <val> - Write debug/access port register\r\n");
             uart_cli_send("  SWD BPTEST               - Run FPB breakpoint self-test\r\n");
             goto api_response;
         }
 
-        // Auto-connect for all SWD commands except CONNECT, CONNECTRST, DISCONNECT
+        // Auto-connect for all SWD commands except CONNECT, CONNECTRST, DISCONNECT,
+        // RACE (races its own connect sequence — an auto-connect here would
+        // defeat the entire point by connecting before the race starts),
+        // SPEED/PHY (pure config, no target access), and BENCH (times its
+        // own connect, same reasoning as RACE)
         if (strcmp(parts->parts[1], "CONNECT") != 0 &&
             strcmp(parts->parts[1], "CONNECTRST") != 0 &&
             strcmp(parts->parts[1], "DISCONNECT") != 0 &&
             strcmp(parts->parts[1], "BPTEST") != 0 &&
-            strcmp(parts->parts[1], "SPEED") != 0) {
+            strcmp(parts->parts[1], "RACE") != 0 &&
+            strcmp(parts->parts[1], "SPEED") != 0 &&
+            strcmp(parts->parts[1], "PHY") != 0 &&
+            strcmp(parts->parts[1], "BENCH") != 0) {
             if (!swd_ensure_connected()) {
                 api_error("ERROR: SWD connection failed (check target power and wiring)\r\n");
                 goto api_response;
@@ -2208,6 +2261,449 @@ void command_parser_execute(cmd_parts_t *parts) {
                 } else {
                     uart_cli_printf("SWD clock delay: %lu us (~%lu kHz)\r\n",
                                     delay, 1000 / (2 * delay));
+                }
+            }
+
+        } else if (strcmp(parts->parts[1], "PHY") == 0) {
+            if (parts->count >= 3) {
+                if (strcmp(parts->parts[2], "BITBANG") == 0) {
+                    if (parts->count >= 4) {
+                        api_error("ERROR: SWD PHY BITBANG takes no argument\r\n");
+                        goto api_response;
+                    }
+                    swd_set_phy_mode(SWD_PHY_BITBANG, 0);
+                    uart_cli_send("OK: SWD physical layer set to BITBANG (forces a reconnect)\r\n");
+                } else if (strcmp(parts->parts[2], "PIO") == 0) {
+                    uint32_t khz = 0;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &khz) || khz == 0) {
+                            api_error_printf("ERROR: Invalid SWD PHY PIO frequency '%s' "
+                                              "(expected a decimal or 0x-prefixed kHz > 0)\r\n",
+                                              parts->parts[3]);
+                            goto api_response;
+                        }
+                    }
+                    if (!swd_set_phy_mode(SWD_PHY_PIO, khz)) {
+                        api_error("ERROR: SWD PHY PIO needs a frequency the first time "
+                                  "it's selected -- SWD PHY PIO <khz>\r\n");
+                        goto api_response;
+                    }
+                    uart_cli_printf("OK: SWD physical layer set to PIO at %lu kHz "
+                                    "(forces a reconnect)\r\n",
+                                    (unsigned long)swd_get_phy_khz());
+                } else {
+                    api_error_printf("ERROR: Unknown SWD PHY mode '%s' (expected BITBANG or PIO)\r\n",
+                                      parts->parts[2]);
+                    goto api_response;
+                }
+            } else {
+                if (swd_get_phy_mode() == SWD_PHY_PIO) {
+                    uart_cli_printf("SWD physical layer: PIO at %lu kHz\r\n",
+                                    (unsigned long)swd_get_phy_khz());
+                } else {
+                    uart_cli_send("SWD physical layer: BITBANG\r\n");
+                }
+            }
+
+        } else if (strcmp(parts->parts[1], "BAT32") == 0) {
+            // BAT32G135 flash writes. Every destructive form requires a
+            // literal CONFIRM token: these operations are not undoable by
+            // any means this firmware implements, and one of them
+            // (ARM) can leave the part permanently protected.
+            extern target_type_t target_get_type(void);
+            const bat32_target_info_t *bi = bat32_get_target_info(target_get_type());
+            if (!bi) {
+                api_error("ERROR: SWD BAT32 requires TARGET BAT32 first\r\n");
+                goto api_response;
+            }
+            if (parts->count < 3) {
+                uart_cli_send("SWD BAT32 PROGRAM <addr> <byte> CONFIRM - program one flash byte\r\n");
+                uart_cli_send("SWD BAT32 PATTERN <addr> <len> CONFIRM - bulk test pattern (blank only)\r\n");
+                uart_cli_send("SWD BAT32 RAMREAD <addr> [words] - read flash VIA the core (L1 bypass)\r\n");
+                uart_cli_send("  RAMREAD is read-only on FLASH but OVERWRITES target SRAM 0x20000000-0x2000101F\r\n");
+                uart_cli_send("SWD BAT32 ARM CONFIRM      - OCDEN 0xFF->0xC3 = protection Level 1\r\n");
+                uart_cli_send("SWD BAT32 DISARM CONFIRM   - OCDEN 0xC3->0x83 (any value != 0xC3 = Level 0)\r\n");
+                uart_cli_send("SWD BAT32 CHIPERASE CONFIRM - erase CODE flash only (the data\r\n");
+                uart_cli_send("                              flash survives it -- use SECTORERASE)\r\n");
+                uart_cli_send("SWD BAT32 SECTORERASE <addr> CONFIRM - erase one sector (the only\r\n");
+                uart_cli_send("                              way to blank data flash 0x500000)\r\n");
+                uart_cli_send("Programming clears bits only (1->0); 0->1 needs an erase.\r\n");
+                goto api_response;
+            }
+
+            const char *op = parts->parts[2];
+            bool is_prog = (strcmp(op, "PROGRAM") == 0);
+            bool is_arm = (strcmp(op, "ARM") == 0);
+            bool is_dis = (strcmp(op, "DISARM") == 0);
+            bool is_ce = (strcmp(op, "CHIPERASE") == 0);
+            bool is_pat = (strcmp(op, "PATTERN") == 0);
+            bool is_wr = (strcmp(op, "WRITE") == 0);
+            bool is_rd = (strcmp(op, "RAMREAD") == 0);
+            bool is_se = (strcmp(op, "SECTORERASE") == 0);
+            if (!is_prog && !is_arm && !is_dis && !is_ce && !is_pat && !is_wr && !is_rd && !is_se) {
+                api_error_printf("ERROR: Unknown SWD BAT32 operation '%s' (expected PROGRAM, "
+                                  "WRITE, PATTERN, RAMREAD, SECTORERASE, ARM, DISARM or "
+                                  "CHIPERASE)\r\n", op);
+                goto api_response;
+            }
+
+            // RAMREAD only ever READS the target's flash (through the core).
+            // It is the one operation here that is not destructive, so it
+            // does not take CONFIRM -- handled before the CONFIRM gate.
+            if (is_rd) {
+                uint32_t src = 0, nw = 4;
+                if (parts->count < 4 || !parse_u32(parts->parts[3], 16, &src)) {
+                    api_error("ERROR: Usage: SWD BAT32 RAMREAD <addr> [words]\r\n");
+                    goto api_response;
+                }
+                if (parts->count >= 5 && !parse_u32(parts->parts[4], 0, &nw)) {
+                    api_error("ERROR: Invalid word count\r\n");
+                    goto api_response;
+                }
+                if (nw == 0 || nw > 1024) {
+                    api_error("ERROR: words must be 1-1024 (4 KB max per pass)\r\n");
+                    goto api_response;
+                }
+                // The copier does a word `ldr`; a misaligned source faults
+                // inside the payload, which would be reported as "did not
+                // reach BKPT" and read like a failure of the bypass itself.
+                if (src & 3u) {
+                    api_error_printf("ERROR: address 0x%08X must be word-aligned\r\n",
+                                     (unsigned)src);
+                    goto api_response;
+                }
+                static uint32_t rbuf[1024];
+                if (!swd_bat32_ram_read(src, nw, rbuf)) {
+                    api_error("ERROR: RAMREAD failed (see log for which step)\r\n");
+                    goto api_response;
+                }
+                for (uint32_t i = 0; i < nw; i += 4) {
+                    uart_cli_printf("0x%08X:", (unsigned)(src + i * 4));
+                    for (uint32_t j = i; j < i + 4 && j < nw; j++)
+                        uart_cli_printf(" %08X", (unsigned)rbuf[j]);
+                    uart_cli_send("\r\n");
+                }
+                uart_cli_printf("OK: %lu words read via core payload\r\n",
+                                (unsigned long)nw);
+                goto api_response;
+            }
+
+            // CONFIRM is always the LAST token; validate everything before
+            // touching hardware (same ordering rule as SWD RACE).
+            const char *last = parts->parts[parts->count - 1];
+            if (parts->count < ((is_prog || is_pat || is_wr) ? 6 : (is_se ? 5 : 4)) ||
+                strcmp(last, "CONFIRM") != 0) {
+                api_error_printf("ERROR: SWD BAT32 %s is destructive and requires a literal "
+                                  "CONFIRM as the last token\r\n", op);
+                goto api_response;
+            }
+
+            uint32_t addr = 0, val = 0;
+            if (is_se) {
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Usage: SWD BAT32 SECTORERASE <addr> CONFIRM\r\n");
+                    goto api_response;
+                }
+            } else if (is_prog) {
+                if (!parse_u32(parts->parts[3], 16, &addr) ||
+                    !parse_u32(parts->parts[4], 16, &val) || val > 0xFF) {
+                    api_error("ERROR: Usage: SWD BAT32 PROGRAM <addr> <byte 0x00-0xFF> CONFIRM\r\n");
+                    goto api_response;
+                }
+            } else if (is_arm || is_dis) {
+                addr = bi->ocden_addr;
+                val = is_arm ? BAT32_OCDEN_PROTECTED : 0x83u;
+            }
+
+            if (is_wr) {
+                // SWD BAT32 WRITE <addr> <hex> CONFIRM — bulk restore path.
+                // 256 bytes max per command (CLI_BUFFER_SIZE is 600, so
+                // 512 hex chars plus the verb fits with margin).
+                static uint8_t wbuf[256];
+                if (!parse_u32(parts->parts[3], 16, &addr)) {
+                    api_error("ERROR: Usage: SWD BAT32 WRITE <addr> <hex bytes> CONFIRM\r\n");
+                    goto api_response;
+                }
+                const char *hex = parts->parts[4];
+                size_t hlen = strlen(hex);
+                if (hlen == 0 || (hlen & 1) || hlen > sizeof(wbuf) * 2) {
+                    api_error_printf("ERROR: hex payload must be an even number of digits, "
+                                      "1-%u bytes (got %u digits)\r\n",
+                                      (unsigned)sizeof(wbuf), (unsigned)hlen);
+                    goto api_response;
+                }
+                uint32_t nb = (uint32_t)(hlen / 2);
+                for (uint32_t i = 0; i < nb; i++) {
+                    char pair[3] = { hex[i * 2], hex[i * 2 + 1], 0 };
+                    char *endp = NULL;
+                    unsigned long v = strtoul(pair, &endp, 16);
+                    if (endp != pair + 2) {
+                        api_error_printf("ERROR: bad hex digit pair '%s' at byte %lu\r\n",
+                                          pair, (unsigned long)i);
+                        goto api_response;
+                    }
+                    wbuf[i] = (uint8_t)v;
+                }
+                if (swd_bat32_flash_program(addr, wbuf, nb))
+                    uart_cli_printf("OK: %lu bytes written at 0x%08X\r\n",
+                                    (unsigned long)nb, (unsigned)addr);
+                else
+                    api_error_printf("ERROR: write failed at 0x%08X\r\n", (unsigned)addr);
+
+            } else if (is_pat) {
+                // Bulk-programming validation (plan travail B.2). Writes a
+                // deterministic address-derived byte so the host can verify
+                // without transferring the data. Refuses any region that is
+                // not already blank -- this must never run over live code.
+                uint32_t len = 0;
+                if (!parse_u32(parts->parts[3], 16, &addr) ||
+                    !parse_u32(parts->parts[4], 0, &len) || len == 0 || len > 8192) {
+                    api_error("ERROR: Usage: SWD BAT32 PATTERN <addr> <len 1-8192> CONFIRM\r\n");
+                    goto api_response;
+                }
+                uint32_t words = (len + 3) / 4;
+                static uint32_t chk[2048];
+                if (words > 2048) words = 2048;
+                if (swd_read_mem(addr & ~3u, chk, words) != words) {
+                    api_error("ERROR: could not read target region before programming\r\n");
+                    goto api_response;
+                }
+                for (uint32_t i = 0; i < words; i++) {
+                    if (chk[i] != 0xFFFFFFFFu) {
+                        api_error_printf("ERROR: region not blank at 0x%08X (= 0x%08X) -- "
+                                          "PATTERN only writes erased flash\r\n",
+                                          (unsigned)((addr & ~3u) + i * 4), (unsigned)chk[i]);
+                        goto api_response;
+                    }
+                }
+                uart_cli_printf("Programming %lu pattern bytes at 0x%08X ...\r\n",
+                                (unsigned long)len, (unsigned)addr);
+                // One call for the whole run: swd_bat32_flash_program()
+                // halts the core and unlocks FLPROT once, then loops the
+                // bytes — exactly like the vendor's ProgramPage(). Calling
+                // it per byte re-halted and re-unlocked 4096 times, which
+                // is both absurdly slow and how the first attempt failed.
+                static uint8_t pat[8192];
+                for (uint32_t i = 0; i < len; i++)
+                    pat[i] = (uint8_t)(((addr + i) ^ 0x5Au) & 0xFFu);
+                bool pok = swd_bat32_flash_program(addr, pat, len);
+                if (pok)
+                    uart_cli_printf("OK: %lu bytes programmed\r\n", (unsigned long)len);
+                else
+                    api_error("ERROR: pattern programming failed (see log)\r\n");
+
+            } else if (is_se) {
+                uart_cli_printf("Erasing the sector containing 0x%08X ...\r\n",
+                                (unsigned)addr);
+                if (swd_bat32_sector_erase(addr))
+                    uart_cli_printf("OK: sector containing 0x%08X erased -- verify by "
+                                    "reading it back\r\n", (unsigned)addr);
+                else
+                    api_error_printf("ERROR: sector erase failed at 0x%08X "
+                                     "(FLSTS.OVF timeout)\r\n", (unsigned)addr);
+
+            } else if (is_ce) {
+                uart_cli_send("Erasing code flash (data flash is NOT affected)...\r\n");
+                if (swd_bat32_chip_erase())
+                    uart_cli_send("OK: chip erase reported complete -- verify by reading 0x0\r\n");
+                else
+                    api_error("ERROR: chip erase did not complete (FLSTS.OVF timeout)\r\n");
+            } else {
+                uint8_t before = 0xFF;
+                uint32_t w = 0;
+                if (swd_read_mem(addr & ~3u, &w, 1) == 1)
+                    before = (uint8_t)(w >> ((addr & 3u) * 8u));
+                uint8_t b = (uint8_t)val;
+                // Programming can only clear bits. Catch an impossible
+                // request here rather than reporting a silent no-op.
+                if ((uint8_t)(before & b) != b) {
+                    api_error_printf("ERROR: 0x%08X holds 0x%02X; writing 0x%02X needs a 0->1 "
+                                      "transition, which requires an erase\r\n",
+                                      (unsigned)addr, before, b);
+                    goto api_response;
+                }
+                uart_cli_printf("Programming 0x%08X: 0x%02X -> 0x%02X ...\r\n",
+                                (unsigned)addr, before, b);
+                if (swd_bat32_flash_program(addr, &b, 1)) {
+                    uint8_t after = 0xFF;
+                    if (swd_read_mem(addr & ~3u, &w, 1) == 1)
+                        after = (uint8_t)(w >> ((addr & 3u) * 8u));
+                    if (after == b)
+                        uart_cli_printf("OK: 0x%08X = 0x%02X (verified)\r\n", (unsigned)addr, after);
+                    else
+                        api_error_printf("ERROR: wrote 0x%02X but read back 0x%02X\r\n", b, after);
+                } else {
+                    api_error("ERROR: flash program failed (see log)\r\n");
+                }
+            }
+
+        } else if (strcmp(parts->parts[1], "BENCH") == 0) {
+            uint32_t us = 0;
+            swd_bench_split_t split = {0, 0, 0};
+            bool ok = swd_bench(&us, &split);
+            const char *phy_desc = (swd_get_phy_mode() == SWD_PHY_PIO) ? "PIO" : "BITBANG";
+            if (ok) {
+                uart_cli_printf("OK: SWD BENCH [%s] connect+AHB-AP+read: %lu us"
+                                " (connect=%lu ahb=%lu read=%lu)\r\n",
+                                phy_desc, (unsigned long)us,
+                                (unsigned long)split.connect_us,
+                                (unsigned long)split.ahb_us,
+                                (unsigned long)split.read_us);
+            } else {
+                api_error_printf("ERROR: SWD BENCH [%s] failed after %lu us "
+                                  "(check target power and wiring)\r\n",
+                                  phy_desc, (unsigned long)us);
+            }
+
+        } else if (strcmp(parts->parts[1], "RACE") == 0) {
+            // Reset-release race: assert/release nRST, wait exactly
+            // delay_us, then race to connect + read the reset vector
+            // before the target's own firmware can lock SWD. See the
+            // block comment above swd_race_once() in swd.c.
+            //
+            // All argument validation happens BEFORE any hardware is
+            // touched (no target_power_ensure_on()/nRST toggling on a
+            // malformed command) — a mistyped SWD RACE must not leave
+            // side effects behind, same as every other command here.
+            if (swd_get_phy_mode() != SWD_PHY_PIO) {
+                api_error("ERROR: SWD RACE requires SWD PHY PIO first -- BITBANG's per-bit "
+                          "delay (or SPEED 0's mis-sampling on this bench, see doc §0bis) "
+                          "dwarfs or corrupts the race window\r\n");
+                goto api_response;
+            }
+
+            // SWD RACE PERSIST <delay_us> [ADDR <hex>] — short-sequence
+            // variant that keeps the DP/AP alive across nRST. See
+            // swd_race_persistent() in swd.c.
+            if (parts->count >= 3 && strcmp(parts->parts[2], "PERSIST") == 0) {
+                uint32_t d = 0, a = 0x00000000u;
+                if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &d)) {
+                    api_error("ERROR: Usage: SWD RACE PERSIST <delay_us> [ADDR <hex>]\r\n");
+                    goto api_response;
+                }
+                if (parts->count >= 6) {
+                    if (strcmp(parts->parts[4], "ADDR") != 0 ||
+                        !parse_u32(parts->parts[5], 16, &a)) {
+                        api_error("ERROR: Usage: SWD RACE PERSIST <delay_us> [ADDR <hex>]\r\n");
+                        goto api_response;
+                    }
+                }
+                if (!swd_ensure_connected()) {
+                    api_error("ERROR: SWD RACE PERSIST needs a live connection first\r\n");
+                    goto api_response;
+                }
+                swd_clear_errors();
+                uint32_t v = 0;
+                uint8_t k = 0;
+                bool got = swd_race_persistent(d, a, &v, &k);
+                uart_cli_printf("RACE-P delay=%luus addr=0x%08X -> %s ACK=0x%X value=0x%08X\r\n",
+                                (unsigned long)d, (unsigned)a,
+                                got ? "READ_OK" : "blocked", k, (unsigned)v);
+                goto api_response;
+            }
+
+            bool is_sweep = (parts->count >= 3 && strcmp(parts->parts[2], "SWEEP") == 0);
+            uint32_t delay_us = 0;
+            uint32_t start_us = 0, end_us = 0, step_us = 0, shots = 1, n_points = 0;
+
+            if (is_sweep) {
+                // SWD RACE SWEEP <start_us> <end_us> <step_us> [SHOTS <n>]
+                if (parts->count < 6) {
+                    api_error("ERROR: Usage: SWD RACE SWEEP <start_us> <end_us> <step_us> [SHOTS <n>]\r\n");
+                    goto api_response;
+                }
+                if (!parse_u32(parts->parts[3], 0, &start_us) ||
+                    !parse_u32(parts->parts[4], 0, &end_us) ||
+                    !parse_u32(parts->parts[5], 0, &step_us)) {
+                    api_error("ERROR: Invalid SWEEP argument (expected <start_us> <end_us> <step_us>, "
+                              "all decimal or 0x-prefixed)\r\n");
+                    goto api_response;
+                }
+                if (parts->count >= 7) {
+                    if (strcmp(parts->parts[6], "SHOTS") != 0) {
+                        api_error_printf("ERROR: Unknown SWD RACE SWEEP option '%s'\r\n", parts->parts[6]);
+                        goto api_response;
+                    }
+                    if (parts->count < 8 || !parse_u32(parts->parts[7], 0, &shots)) {
+                        api_error("ERROR: SHOTS requires a count. Usage: ... SHOTS <n>\r\n");
+                        goto api_response;
+                    }
+                }
+                if (end_us < start_us || step_us == 0) {
+                    api_error("ERROR: Invalid SWEEP range (need end_us >= start_us and step_us > 0)\r\n");
+                    goto api_response;
+                }
+                n_points = (end_us - start_us) / step_us + 1;
+                if (n_points > SWD_RACE_SWEEP_MAX_POINTS ||
+                    shots == 0 || shots > SWD_RACE_SWEEP_MAX_SHOTS) {
+                    api_error_printf("ERROR: SWEEP too large (max %lu delay points x %lu shots)\r\n",
+                                      (unsigned long)SWD_RACE_SWEEP_MAX_POINTS,
+                                      (unsigned long)SWD_RACE_SWEEP_MAX_SHOTS);
+                    goto api_response;
+                }
+            } else if (parts->count >= 3) {
+                // Single-shot: SWD RACE [<delay_us>]
+                if (!parse_u32(parts->parts[2], 0, &delay_us)) {
+                    api_error("ERROR: Invalid delay_us. Usage: SWD RACE [<delay_us>]\r\n");
+                    goto api_response;
+                }
+            }
+
+            // Arguments are valid — from here on this touches hardware.
+            uint32_t sram_base = 0, sram_size = 0, flash_base = 0, flash_size = 0;
+            const bat32_target_info_t *bi = bat32_get_target_info(target_get_type());
+            if (bi) {
+                sram_base = bi->sram_base;
+                sram_size = bi->sram_size;
+                flash_base = bi->code_flash_base;
+                flash_size = bi->code_flash_size;
+            }
+
+            target_power_ensure_on();  // energise target first (power-off boot default)
+
+            if (is_sweep) {
+                if (!bi) {
+                    uart_cli_send("WARNING: no TARGET BAT32 selected -- SUCCESS plausibility "
+                                  "check disabled, results will only show blocked/perturbed\r\n");
+                }
+                uart_cli_printf("SWD RACE SWEEP: %lu..%luus step %luus, %lu shot(s)/point "
+                                "(%lu attempts total) -- any key aborts\r\n",
+                                (unsigned long)start_us, (unsigned long)end_us,
+                                (unsigned long)step_us, (unsigned long)shots,
+                                (unsigned long)(n_points * shots));
+
+                swd_race_report_t rep;
+                bool ok = swd_race_sweep(start_us, end_us, step_us, shots,
+                                          sram_base, sram_size, flash_base, flash_size, &rep);
+                if (ok) {
+                    uart_cli_printf("OK: SWD RACE SWEEP success at the delay reported above "
+                                    "-- target left powered + connected, dump now "
+                                    "(SP=0x%08lX PC=0x%08lX)\r\n",
+                                    (unsigned long)rep.sp, (unsigned long)rep.pc);
+                } else {
+                    api_error("ERROR: SWD RACE SWEEP finished without a SUCCESS (see log above)\r\n");
+                }
+
+            } else {
+                swd_race_report_t rep;
+                bool success = swd_race_once(delay_us, sram_base, sram_size,
+                                              flash_base, flash_size, &rep);
+                const char *result_str =
+                    rep.result == SWD_RACE_NO_DP       ? "no_dp" :
+                    rep.result == SWD_RACE_DP_ONLY      ? "dp_only" :
+                    rep.result == SWD_RACE_MEM_BLOCKED  ? "mem_blocked" :
+                    rep.result == SWD_RACE_PERTURBED    ? "perturbed" : "SUCCESS";
+                uart_cli_printf("RACE delay=%luus -> %s  SP=0x%08lX PC=0x%08lX\r\n",
+                                (unsigned long)delay_us, result_str,
+                                (unsigned long)rep.sp, (unsigned long)rep.pc);
+                if (success) {
+                    uart_cli_send("OK: SWD RACE SUCCESS -- target left powered + connected, "
+                                  "dump now (do not reset or power-cycle)\r\n");
+                } else {
+                    if (!bi)
+                        uart_cli_send("NOTE: no TARGET BAT32 selected -- SUCCESS plausibility "
+                                      "check was disabled for this attempt\r\n");
+                    api_error("ERROR: no SUCCESS this attempt\r\n");
                 }
             }
 
@@ -2847,6 +3343,11 @@ void command_parser_execute(cmd_parts_t *parts) {
             // SWD RDP [SET <0|1>]
             extern target_type_t target_get_type(void);
             target_type_t tt = target_get_type();
+            if (target_is_bat32(tt)) {
+                api_error("ERROR: BAT32G135 has no RDP register -- its protection model is "
+                          "OCDEN/OCDM option bytes (Level 0/1/2), use SWD OPT instead\r\n");
+                goto api_response;
+            }
             if (!target_is_stm32(tt)) {
                 if (!swd_auto_detect_target()) {
                     api_error("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");
@@ -2899,6 +3400,13 @@ void command_parser_execute(cmd_parts_t *parts) {
             // SWD OPT - read option bytes
             extern target_type_t target_get_type(void);
             target_type_t tt = target_get_type();
+            if (target_is_bat32(tt)) {
+                const bat32_target_info_t *info = bat32_get_target_info(tt);
+                if (!swd_bat32_read_options(info)) {
+                    api_error("ERROR: Could not read option bytes\r\n");
+                }
+                goto api_response;
+            }
             if (!target_is_stm32(tt)) {
                 if (!swd_auto_detect_target()) {
                     api_error("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");
@@ -2915,6 +3423,11 @@ void command_parser_execute(cmd_parts_t *parts) {
             // SWD FLASH <ERASE|TEST>
             extern target_type_t target_get_type(void);
             target_type_t tt = target_get_type();
+            if (target_is_bat32(tt)) {
+                api_error("ERROR: BAT32G135 flash writes are under SWD BAT32, not SWD FLASH "
+                          "(page-erase semantics differ) -- see SWD BAT32 HELP\r\n");
+                goto api_response;
+            }
             if (!target_is_stm32(tt)) {
                 if (!swd_auto_detect_target()) {
                     api_error("ERROR: Could not auto-detect STM32 family. Set TARGET manually.\r\n");

@@ -6,6 +6,9 @@
  */
 
 #include "swd.h"
+#include "net_cli.h"
+#include "swd_phy.h"
+#include "bat32_target.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/timer.h"
@@ -14,6 +17,12 @@
 // Clock half-period in microseconds (0 = max speed, 1 = ~500kHz, 2 = ~250kHz)
 // Default 1: max speed=0 is too fast for STM32F1 @ 8MHz HSI (AP reads fail)
 static uint32_t clk_delay_us = 1;
+
+// Physical layer selection -- see swd_set_phy_mode() / swd_phy.h. Default
+// bit-bang: PIO mode is an explicit opt-in (SWD PHY PIO), not a silent
+// change in boot behavior.
+static swd_phy_mode_t phy_mode = SWD_PHY_BITBANG;
+static uint32_t phy_khz_last = 0;
 
 static bool initialized = false;
 static bool connected = false;
@@ -55,6 +64,36 @@ uint32_t swd_get_speed(void) {
     return clk_delay_us;
 }
 
+bool swd_set_phy_mode(swd_phy_mode_t mode, uint32_t khz_if_pio) {
+    if (mode == SWD_PHY_PIO) {
+        uint32_t khz = khz_if_pio ? khz_if_pio : phy_khz_last;
+        if (khz == 0)
+            return false;  // never configured, and none given now
+        if (connected)
+            swd_deinit();  // pins' funcsel changes underneath either way
+        phy_mode = SWD_PHY_PIO;
+        phy_khz_last = khz;
+        // Actual pio_add_program()/pio_sm_init() happens lazily in
+        // swd_connect_ex() (mirrors the bit-bang path, which also only
+        // touches pins there) -- this call just records the mode + freq.
+    } else {
+        if (connected)
+            swd_deinit();
+        if (phy_mode == SWD_PHY_PIO)
+            swd_phy_deinit(SWD_SWCLK_PIN, SWD_SWDIO_PIN);
+        phy_mode = SWD_PHY_BITBANG;
+    }
+    return true;
+}
+
+swd_phy_mode_t swd_get_phy_mode(void) {
+    return phy_mode;
+}
+
+uint32_t swd_get_phy_khz(void) {
+    return phy_khz_last;
+}
+
 static inline void swclk_set(void) {
     gpio_put(SWD_SWCLK_PIN, 1);
 }
@@ -83,12 +122,20 @@ static inline void swdio_in(void) {
     gpio_set_dir(SWD_SWDIO_PIN, GPIO_IN);
 }
 
-// Turnaround - exact copy of BMP swdptap_turnaround.
-// Does NOT assume a specific SWCLK state on entry.
+// Turnaround - exact copy of BMP swdptap_turnaround for the bit-bang path.
+// Does NOT assume a specific SWCLK state on entry. The no-op-if-unchanged
+// check and swdio_dir bookkeeping apply to BOTH physical layers -- this is
+// the only place that decides whether a clock is emitted at all; it calls
+// out to swd_phy_turnaround() only on the branch where it actually is.
 static void swd_turnaround(swdio_dir_t dir) {
     if (dir == swdio_dir)
         return;
     swdio_dir = dir;
+
+    if (phy_mode == SWD_PHY_PIO) {
+        swd_phy_turnaround(dir == SWDIO_DRIVE);
+        return;
+    }
 
     if (dir == SWDIO_FLOAT) {
         // BMP: release SWDIO, SWCLK untouched
@@ -110,9 +157,14 @@ static void swd_turnaround(swdio_dir_t dir) {
 }
 
 // Output bits LSB first (matches BMP swdptap_seq_out_clk_delay)
-// Ends with SWCLK LOW (trailing clr, same as BMP)
+// Ends with SWCLK LOW (trailing clr, same as BMP) in the bit-bang path;
+// swd_phy_out() reproduces the same LSB-first / SWCLK-low postcondition.
 static void swd_seq_out(uint32_t data, size_t bits) {
     swd_turnaround(SWDIO_DRIVE);
+    if (phy_mode == SWD_PHY_PIO) {
+        swd_phy_out(data, bits);
+        return;
+    }
     for (size_t i = 0; i < bits; i++) {
         swclk_clr();
         gpio_put(SWD_SWDIO_PIN, data & 1);
@@ -125,10 +177,12 @@ static void swd_seq_out(uint32_t data, size_t bits) {
 }
 
 // Input bits LSB first (matches BMP swdptap_seq_in_clk_delay)
-// Sample immediately after falling edge (same as BMP)
-// Ends with SWCLK LOW (trailing clr)
+// Sample immediately after falling edge (same as BMP) in the bit-bang path;
+// swd_phy_in() reproduces the same LSB-first sample-on-falling-edge result.
 static uint32_t swd_seq_in(size_t bits) {
     swd_turnaround(SWDIO_FLOAT);
+    if (phy_mode == SWD_PHY_PIO)
+        return swd_phy_in(bits);
     uint32_t data = 0;
     for (size_t i = 0; i < bits; i++) {
         swclk_clr();
@@ -152,31 +206,26 @@ static bool calc_parity(uint32_t data) {
     return data & 1;
 }
 
-// Output 32 bits with parity (matches BMP swdptap_seq_out_parity)
-// seq_out ends SWCLK LOW. Set parity on SWDIO, then clock it in, end SWCLK LOW.
+// Output 32 bits with parity (matches BMP swdptap_seq_out_parity).
+// The parity bit is emitted via swd_seq_out(bit, 1) rather than duplicated
+// raw GPIO code -- for bits=1 that call reduces to exactly the same
+// CLR/write/delay/SET/delay/CLR pattern this used to do inline (the
+// leading CLR is redundant, SWCLK is already low from seq_out's trailing
+// CLR, matching BMP), and it's what keeps this function correct in
+// SWD_PHY_PIO instead of poking SIO registers a PIO-owned pin ignores.
 static void swd_seq_out_parity(uint32_t data) {
     swd_seq_out(data, 32);
-    // SWCLK is LOW from seq_out's trailing CLR
-    gpio_put(SWD_SWDIO_PIN, calc_parity(data));
-    clk_delay();
-    swclk_set();
-    clk_delay();
-    swclk_clr();
+    swd_seq_out(calc_parity(data) ? 1u : 0u, 1);
 }
 
-// Input 32 bits with parity check (matches BMP swdptap_seq_in_parity)
-// Reads parity bit using same clock pattern as seq_in (CLR/read/delay/SET/delay/CLR).
+// Input 32 bits with parity check (matches BMP swdptap_seq_in_parity).
+// The parity bit is read via swd_seq_in(1) for the same reason as above:
+// for bits=1 it samples at the identical point (immediately after the
+// falling edge, before the delay) as the raw code this replaces.
 // Ends SWCLK LOW, then calls turnaround(DRIVE).
 static bool swd_seq_in_parity(uint32_t *data) {
     *data = swd_seq_in(32);
-    // SWCLK is LOW from seq_in's trailing CLR
-    // Read parity bit with same pattern as seq_in_clk_delay(1) in BMP:
-    swclk_clr();  // redundant (already LOW), matches BMP
-    bool parity_bit = swdio_get();
-    clk_delay();
-    swclk_set();
-    clk_delay();
-    swclk_clr();  // trailing CLR — SWCLK LOW, matches BMP
+    bool parity_bit = (swd_seq_in(1) & 1u) != 0;
     swd_turnaround(SWDIO_DRIVE);
     return calc_parity(*data) == parity_bit;
 }
@@ -258,13 +307,17 @@ void swd_deinit(void) {
         }
     }
 
-    gpio_set_dir(SWD_SWCLK_PIN, GPIO_IN);
-    gpio_set_dir(SWD_SWDIO_PIN, GPIO_IN);
+    if (phy_mode == SWD_PHY_PIO) {
+        swd_phy_deinit(SWD_SWCLK_PIN, SWD_SWDIO_PIN);  // funcsel back to SIO input
+    } else {
+        gpio_set_dir(SWD_SWCLK_PIN, GPIO_IN);
+        gpio_set_dir(SWD_SWDIO_PIN, GPIO_IN);
+    }
     initialized = false;
     connected = false;
 }
 
-bool swd_connect(void) {
+bool swd_connect_ex(bool fast) {
     if (!initialized)
         swd_init();
 
@@ -272,15 +325,25 @@ bool swd_connect(void) {
     ahb_initialized = false;
     current_select = 0xFFFFFFFF;
 
-    // Force full pin init (in case another subsystem changed pin function)
-    gpio_init(SWD_SWCLK_PIN);
-    gpio_set_dir(SWD_SWCLK_PIN, GPIO_OUT);
-    gpio_put(SWD_SWCLK_PIN, 0);
-    gpio_init(SWD_SWDIO_PIN);
-    gpio_set_dir(SWD_SWDIO_PIN, GPIO_OUT);
-    gpio_put(SWD_SWDIO_PIN, 1);
+    if (phy_mode == SWD_PHY_PIO) {
+        // Re-claim PIO2 SM0 at the last-configured frequency (in case
+        // another subsystem changed pin function -- same rationale as the
+        // bit-bang branch below). swd_phy_init() is idempotent.
+        swd_phy_init(SWD_SWCLK_PIN, SWD_SWDIO_PIN, phy_khz_last);
+    } else {
+        // Force full pin init (in case another subsystem changed pin function)
+        gpio_init(SWD_SWCLK_PIN);
+        gpio_set_dir(SWD_SWCLK_PIN, GPIO_OUT);
+        gpio_put(SWD_SWCLK_PIN, 0);
+        gpio_init(SWD_SWDIO_PIN);
+        gpio_set_dir(SWD_SWDIO_PIN, GPIO_OUT);
+        gpio_put(SWD_SWDIO_PIN, 1);
+    }
     swdio_dir = SWDIO_DRIVE;
-    sleep_ms(1);  // Let pins settle
+    // fast (race path): skip the pin-settle delay — it's the single biggest
+    // fixed cost on the reset-release -> first-SWCLK-edge critical path.
+    if (!fast)
+        sleep_ms(1);  // Let pins settle
 
     // === Method 1: Legacy JTAG-to-SWD ===
     swd_line_reset();
@@ -291,9 +354,25 @@ bool swd_connect(void) {
     uint32_t dpidr;
     if (swd_read_dp(DP_DPIDR, &dpidr)) {
         swd_write_dp(DP_ABORT, 0x1E);
-        printf("[SWD] Connected, DPIDR=0x%08X\r\n", (unsigned)dpidr);
+        // Not on the fast path: this is a USB CDC printf, and stdio over CDC
+        // blocks for on the order of a millisecond. Called from
+        // swd_race_once(), it lands INSIDE the timed critical section and
+        // dwarfs the race window it is trying to hit (measured 2026-09-01:
+        // it is the bulk of SWD BENCH's frequency-independent floor -- at
+        // PIO 8 MHz the whole sequence took 1521us, of which the actual SWD
+        // traffic is a small fraction). The caller prints DPIDR itself.
+        if (!fast)
+            printf("[SWD] Connected, DPIDR=0x%08X\r\n", (unsigned)dpidr);
         connected = true;
         return true;
+    }
+
+    // fast (race path): don't try the ADIv5.2 dormant-state fallback — it
+    // doubles the connect duration and a dormant-state target is out of
+    // scope for a reset-release race (the target just came out of reset).
+    if (fast) {
+        printf("[SWD] Connect failed (fast), ACK=0x%X\r\n", last_ack);
+        return false;
     }
 
     // === Method 2: ADIv5.2 Dormant-to-SWD ===
@@ -320,6 +399,10 @@ bool swd_connect(void) {
 
     printf("[SWD] Connect failed, ACK=0x%X\r\n", last_ack);
     return false;
+}
+
+bool swd_connect(void) {
+    return swd_connect_ex(false);
 }
 
 bool swd_is_connected(void) {
@@ -399,12 +482,19 @@ bool swd_connect_under_reset(void) {
         if ((dhcsr & ((1U << 17) | (1U << 0))) == ((1U << 17) | (1U << 0))) {
             printf("[SWD] CUR: Halted at reset vector, DHCSR=0x%08X\r\n", (unsigned)dhcsr);
 
-            // Freeze IWDG and WWDG in debug mode via DBGMCU_CR
-            #define DBGMCU_CR 0xE0042004
-            uint32_t dbg_cr;
-            mem_read32(DBGMCU_CR, &dbg_cr);
-            dbg_cr |= (1U << 8) | (1U << 9);  // DBG_IWDG_STOP | DBG_WWDG_STOP
-            mem_write32(DBGMCU_CR, dbg_cr);
+            // Freeze IWDG and WWDG in debug mode via DBGMCU_CR.
+            // STM32-only register (0xE0042000 range, same block as
+            // DBG_IDCODE) — not mapped on other Cortex-M families
+            // (e.g. BAT32G135), so only touch it when the selected
+            // target is actually an STM32.
+            extern target_type_t target_get_type(void);
+            if (target_is_stm32(target_get_type())) {
+                #define DBGMCU_CR 0xE0042004
+                uint32_t dbg_cr;
+                mem_read32(DBGMCU_CR, &dbg_cr);
+                dbg_cr |= (1U << 8) | (1U << 9);  // DBG_IWDG_STOP | DBG_WWDG_STOP
+                mem_write32(DBGMCU_CR, dbg_cr);
+            }
 
             return true;
         }
@@ -587,36 +677,65 @@ static uint32_t ap_csw_base = 0;
 #define CSW_HNOSEC        (1U << 30)
 
 // Initialize AHB-AP for memory access.
-static bool swd_init_ahb_ap(void) {
+static bool swd_init_ahb_ap_ex(bool fast) {
     uint32_t stat;
 
-    // Clear sticky errors first (BMP: adiv5_dp_abort before dp_init)
-    swd_write_dp(DP_ABORT, 0x1E);
+    if (fast) {
+        // Race path: skip the abort-clear (swd_connect_ex(true) already
+        // did one right after reading DPIDR) and the power-down request +
+        // ack-wait -- the debug domain is guaranteed powered down right
+        // after the hardware reset swd_race_once() just performed a
+        // moment ago. Every transaction cut here is time still spent
+        // inside the race window instead of proving what the reset
+        // already guarantees (observed on real BAT32G135 hardware:
+        // 13/13 dp_only hits across a 2550-shot sweep never got past this
+        // function -- the window was closing before it returned).
+    } else {
+        // Clear sticky errors first (BMP: adiv5_dp_abort before dp_init)
+        swd_write_dp(DP_ABORT, 0x1E);
 
-    // Step 1: Power DOWN debug domain (BMP: adiv5_dp_write(dp, CTRLSTAT, 0))
-    if (!swd_write_dp(DP_CTRL_STAT, 0))
-        return false;
-
-    // Wait for power-down acknowledge (ACK bits clear)
-    for (int i = 0; i < 250; i++) {
-        if (!swd_read_dp(DP_CTRL_STAT, &stat))
+        // Step 1: Power DOWN debug domain (BMP: adiv5_dp_write(dp, CTRLSTAT, 0))
+        if (!swd_write_dp(DP_CTRL_STAT, 0))
             return false;
-        if (!(stat & 0xA0000000))
-            break;
-        sleep_ms(1);
+
+        // Wait for power-down acknowledge (ACK bits clear). Sleep is at the
+        // TAIL of this loop (after the check), so on the common case —
+        // domain already down after a reset — it costs nothing.
+        for (int i = 0; i < 250; i++) {
+            if (!swd_read_dp(DP_CTRL_STAT, &stat))
+                return false;
+            if (!(stat & 0xA0000000))
+                break;
+            sleep_ms(1);
+        }
     }
 
     // Step 2: Power UP (BMP: CSYSPWRUPREQ | CDBGPWRUPREQ)
     if (!swd_write_dp(DP_CTRL_STAT, 0x50000000))
         return false;
 
-    // Wait for power-up acknowledge (BMP: polls with 10ms delay)
-    for (int i = 0; i < 200; i++) {
-        sleep_ms(1);
+    // Wait for power-up acknowledge.
+    // fast (race path): the unconditional sleep_ms(1) BEFORE the first check
+    // (paid even when the domain has already acked) is the single largest
+    // fixed cost on the reset-release -> first-memory-read critical path.
+    // Check immediately, then fall back to short bounded polling instead.
+    if (fast) {
         if (!swd_read_dp(DP_CTRL_STAT, &stat))
             return false;
-        if ((stat & 0xA0000000) == 0xA0000000)
-            break;
+        for (int i = 0; i < 400 && (stat & 0xA0000000) != 0xA0000000; i++) {
+            busy_wait_us_32(5);
+            if (!swd_read_dp(DP_CTRL_STAT, &stat))
+                return false;
+        }
+    } else {
+        // Wait for power-up acknowledge (BMP: polls with 10ms delay)
+        for (int i = 0; i < 200; i++) {
+            sleep_ms(1);
+            if (!swd_read_dp(DP_CTRL_STAT, &stat))
+                return false;
+            if ((stat & 0xA0000000) == 0xA0000000)
+                break;
+        }
     }
 
     if ((stat & 0xA0000000) != 0xA0000000)
@@ -625,9 +744,17 @@ static bool swd_init_ahb_ap(void) {
     // Clear sticky errors after power cycle
     swd_write_dp(DP_ABORT, 0x1E);
 
-    // BMP: adiv5_new_ap reads IDR, BASE, CSW from AP defaults
-    uint32_t ap_idr;
-    swd_read_ap(0, AP_IDR, &ap_idr);
+    // BMP: adiv5_new_ap reads IDR, BASE, CSW from AP defaults.
+    // The IDR value is discarded -- nothing in this file ever reads it --
+    // so on the race path it is a whole AP read (posted read + RDBUFF DP
+    // read, plus a DP_SELECT write since IDR is in APBANKSEL 0xF while CSW
+    // is in bank 0) bought for nothing. Kept off the fast path only; the
+    // fast=false path is unchanged so the STM32/LPC workflows keep the
+    // exact bring-up they were validated with.
+    if (!fast) {
+        uint32_t ap_idr;
+        swd_read_ap(0, AP_IDR, &ap_idr);
+    }
 
     uint32_t csw_default;
     swd_read_ap(0, AP_CSW, &csw_default);
@@ -638,6 +765,10 @@ static bool swd_init_ahb_ap(void) {
     ap_csw_base |= CSW_DBGSWENABLE;
 
     return true;
+}
+
+static bool swd_init_ahb_ap(void) {
+    return swd_init_ahb_ap_ex(false);
 }
 
 // BMP: ap_mem_access_setup — writes CSW + TAR before every memory operation
@@ -655,6 +786,19 @@ static bool swd_mem_access_setup(uint32_t addr) {
     return true;
 }
 
+// ADIv5 only guarantees TAR auto-increment inside a 1 KB window: past the
+// boundary the AP wraps back to the start of that window and silently
+// re-serves data already read, with no error anywhere. Any transfer that
+// crosses a 1 KB boundary must therefore re-arm TAR. Measured on the
+// BAT32G135 bench: a 4 KB read from 0x20000020 was correct up to 0x3E0
+// (= 0x20000400) and repeated itself from there on.
+#define AP_TAR_WINDOW 0x400u
+
+static uint32_t swd_window_words(uint32_t addr, uint32_t remaining) {
+    uint32_t left = (AP_TAR_WINDOW - (addr & (AP_TAR_WINDOW - 1u))) / 4u;
+    return remaining < left ? remaining : left;
+}
+
 uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count) {
     if (!initialized || count == 0)
         return 0;
@@ -665,16 +809,21 @@ uint32_t swd_read_mem(uint32_t addr, uint32_t *data, uint32_t count) {
         ahb_initialized = true;
     }
 
-    // BMP: setup CSW + TAR before access
-    if (!swd_mem_access_setup(addr))
-        return 0;
-
-    // Read words
     uint32_t read = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if (!swd_read_ap(0, AP_DRW, &data[i]))
+    while (read < count) {
+        uint32_t cur = addr + read * 4;
+        uint32_t chunk = swd_window_words(cur, count - read);
+
+        // BMP: setup CSW + TAR before access — and again at every window
+        if (!swd_mem_access_setup(cur))
             break;
-        read++;
+
+        uint32_t got = 0;
+        while (got < chunk && swd_read_ap(0, AP_DRW, &data[read + got]))
+            got++;
+        read += got;
+        if (got < chunk)
+            break;
     }
 
     return read;
@@ -690,23 +839,335 @@ uint32_t swd_write_mem(uint32_t addr, const uint32_t *data, uint32_t count) {
         ahb_initialized = true;
     }
 
-    // BMP: setup CSW + TAR before access
-    if (!swd_mem_access_setup(addr))
-        return 0;
-
-    // Write words
     uint32_t written = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if (!swd_write_ap(0, AP_DRW, data[i]))
+    while (written < count) {
+        uint32_t cur = addr + written * 4;
+        uint32_t chunk = swd_window_words(cur, count - written);
+
+        // Same 1 KB TAR window as in swd_read_mem() — a write that crosses
+        // it would land back at the start of the window, corrupting data
+        // already written instead of continuing.
+        if (!swd_mem_access_setup(cur))
             break;
-        written++;
+
+        uint32_t done = 0;
+        while (done < chunk && swd_write_ap(0, AP_DRW, data[written + done]))
+            done++;
+
+        // BMP: flush write buffer by reading RDBUFF
+        uint32_t dummy;
+        swd_read_dp(DP_RDBUFF, &dummy);
+
+        written += done;
+        if (done < chunk)
+            break;
     }
 
-    // BMP: flush write buffer by reading RDBUFF
-    uint32_t dummy;
-    swd_read_dp(DP_RDBUFF, &dummy);
-
     return written;
+}
+
+// --- Reset-release race (RESETB vs SWD) ---
+//
+// swd_connect_under_reset() (above) connects to the target WHILE nRST is
+// held low, then releases — that only works if the target's SW-DP still
+// answers with the reset asserted. Some parts (e.g. BAT32G135 per its
+// user manual — SWDIO/SWCLK are high-impedance during an external reset
+// or POR) do not. For those, the only way in is the inverse: release
+// nRST, then race the target's own firmware to connect over SWD before
+// it can lock the interface (e.g. writing a SWD-disable bit at runtime).
+// This is a pure timing race, not a fault injection — see
+// 07_BAT32G135_FAULTYCAT.md §9/§9bis/§9ter for the full rationale.
+
+bool swd_race_persistent(uint32_t delay_us, uint32_t addr,
+                          uint32_t *value, uint8_t *ack) {
+    if (value) *value = 0;
+    if (ack) *ack = 0;
+
+    if (!connected || !ahb_initialized) {
+        printf("[RACE-P] needs an established connection + AHB-AP first\r\n");
+        return false;
+    }
+
+    // A partir d'ici tout est chronometre : cette variante existe pour que
+    // le premier acces memoire tombe quelques microsecondes apres le front
+    // de reset, au lieu de 250. Une interruption Wi-Fi y serait du meme
+    // ordre de grandeur que la fenetre mesuree. Sortie garantie par
+    // l'attribut cleanup malgre les `return` qui suivent.
+    NET_QUIET_SECTION;
+
+    // Pre-arm the AP so that after the reset edge only the DRW read
+    // remains. CSW/TAR are written here, BEFORE nRST — that is the whole
+    // point of this variant.
+    uint32_t csw = ap_csw_base | CSW_SIZE_WORD | CSW_ADDRINC_SINGLE;
+    if (!swd_write_ap(0, AP_CSW, csw) || !swd_write_ap(0, AP_TAR, addr)) {
+        printf("[RACE-P] pre-arm of CSW/TAR failed\r\n");
+        return false;
+    }
+
+    if (phy_mode == SWD_PHY_PIO) {
+        swd_phy_nrst_race(SWD_NRST_PIN, delay_us);
+    } else {
+        swd_nrst_assert();
+        busy_wait_us_32(20);
+        swd_nrst_release();
+        if (delay_us)
+            busy_wait_us_32(delay_us);
+    }
+
+    // Single posted AP read + RDBUFF. No line reset, no DPIDR, no AHB-AP
+    // bring-up: if the DP survived nRST this is the earliest possible
+    // flash access.
+    uint32_t dummy = 0;
+    uint8_t req = make_request(true, true, AP_DRW & 0xC);
+    swd_seq_out(req, 8);
+    last_ack = swd_seq_in(3);
+    if (ack) *ack = last_ack;
+    if (last_ack != SWD_ACK_OK) {
+        swd_turnaround(SWDIO_DRIVE);
+        return false;
+    }
+    swd_seq_in_parity(&dummy);
+    swd_seq_out(0, 8);
+
+    uint32_t v = 0;
+    bool ok = swd_read_dp(DP_RDBUFF, &v);
+    if (ack) *ack = last_ack;
+    if (value) *value = v;
+    return ok;
+}
+
+bool swd_race_once(uint32_t delay_us,
+                    uint32_t sram_base, uint32_t sram_size,
+                    uint32_t flash_base, uint32_t flash_size,
+                    swd_race_report_t *report) {
+    swd_race_report_t rep = { SWD_RACE_NO_DP, 0, 0 };
+
+    // THIS is the parameter under test: time from reset release to the
+    // start of the SWD connect sequence. Passed through exactly as
+    // given — no clamping, no compensation subtracted. A sweep whose
+    // low end silently gets rewritten produces a heat map that lies
+    // about what was actually measured (cf. the glitch engine's PAUSE
+    // 0-18 dead zone and WIDTH/GAP non-monotonicity in glitch.c — the
+    // failure mode this deliberately avoids repeating).
+    //
+    // In SWD_PHY_PIO, the whole assert/hold-tRSL/release/wait-delay_us
+    // sequence runs on PIO2 SM1 (swd_phy_nrst_race()), so the C jitter
+    // between "reset released" and "start counting delay_us" — and
+    // between "delay_us elapsed" and "first SWCLK edge" (SM0, same PIO2
+    // instance) — is gone; the CLI layer requires SWD PHY PIO before
+    // SWD RACE runs for exactly this reason. The bit-bang branch below
+    // stays correct (and is what a direct, non-CLI caller would still
+    // get) but is no longer reachable through the shipped CLI.
+    if (phy_mode == SWD_PHY_PIO) {
+        // A false return means the PIO sequencer itself never signaled
+        // completion (no pull-up, pin disconnected, ...) -- proceeding
+        // anyway would otherwise report a bare no_dp indistinguishable
+        // from "the target locked SWD before we got there", which is
+        // exactly the misdiagnosis this whole investigation started from
+        // (see §0bis of 07_BAT32G135_FAULTYCAT.md). Flag it loudly instead
+        // of silently folding it into the same category.
+        if (!swd_phy_nrst_race(SWD_NRST_PIN, delay_us)) {
+            printf("[SWD RACE] WARNING: nRST sequencer timed out (delay_us=%lu) -- "
+                   "check nRST wiring/pull-up before trusting this attempt's "
+                   "classification\r\n", (unsigned long)delay_us);
+        }
+    } else {
+        // Hold reset for a fixed, short dwell — this is NOT the
+        // parameter under test, just enough to guarantee a clean assert
+        // (BAT32G135 tRSL minimum is 10us, [DS] §6.6; comfortably
+        // covered here).
+        swd_nrst_assert();
+        busy_wait_us_32(20);
+        swd_nrst_release();
+        if (delay_us)
+            busy_wait_us_32(delay_us);
+    }
+
+    // Section silencieuse a partir d'ici seulement.
+    //
+    // Elle ne remonte deliberement PAS jusqu'a la sequence de reset : en mode
+    // PIO celle-ci est executee par PIO2 SM1 et se moque des interruptions du
+    // coeur (voir le commentaire d'en-tete de cette fonction), et surtout le
+    // WARNING de cablage nRST ci-dessus doit pouvoir sortir. C'est lui qui
+    // distingue « nRST mal cable » de « la cible a verrouille SWD » -- la
+    // confusion meme dont est partie toute cette campagne. Dans une section
+    // silencieuse et le tampon plein, il serait jete et compte, donc perdu
+    // pour un client TCP.
+    //
+    // Ce qui suit, en revanche, est du code coeur chronometre : le connect
+    // doit tomber le plus tot possible apres le front de reset.
+    NET_QUIET_SECTION;
+
+    // Fast path throughout: uncompensated connect + AHB-AP bring-up.
+    // In SWD_PHY_BITBANG this does NOT use clk_delay_us beyond what
+    // swd_connect_ex()/swd_init_ahb_ap_ex() already force — the CLI layer
+    // requires SWD PHY PIO before SWD RACE runs, since any per-bit
+    // bit-bang delay (or SPEED 0's mis-sampling, see §0bis of
+    // 07_BAT32G135_FAULTYCAT.md) dwarfs or corrupts the window measured.
+    if (!swd_connect_ex(true)) {
+        if (report) *report = rep;
+        return false;
+    }
+    rep.result = SWD_RACE_DP_ONLY;
+
+    ahb_initialized = false;
+    if (!swd_init_ahb_ap_ex(true)) {
+        if (report) *report = rep;
+        return false;
+    }
+    ahb_initialized = true;
+
+    uint32_t words[2] = {0, 0};
+    if (swd_read_mem(0x00000000, words, 2) != 2) {
+        if (report) *report = rep;
+        return false;
+    }
+    rep.sp = words[0];
+    rep.pc = words[1];
+
+    if (rep.sp == 0x00000000 || rep.sp == 0xFFFFFFFF) {
+        rep.result = SWD_RACE_MEM_BLOCKED;
+        if (report) *report = rep;
+        return false;
+    }
+
+    // Cortex-M reset-vector plausibility check (doc §8.2): SP inside the
+    // target's SRAM, PC inside its code flash with the Thumb bit set.
+    // Only applied when the caller supplied real bounds (current TARGET
+    // has a descriptor) — otherwise a non-blocked read is reported as
+    // "perturbed" rather than risking a false SUCCESS.
+    bool have_bounds = (sram_size != 0 && flash_size != 0);
+    bool plausible = have_bounds &&
+        rep.sp >= sram_base && rep.sp < sram_base + sram_size &&
+        rep.pc >= flash_base && rep.pc < flash_base + flash_size &&
+        (rep.pc & 1);
+
+    rep.result = plausible ? SWD_RACE_SUCCESS : SWD_RACE_PERTURBED;
+    if (report) *report = rep;
+    return plausible;
+}
+
+// Times the same fast connect + AHB-AP bring-up + 2-word read that
+// swd_race_once() runs, without touching nRST — the "SWD BENCH" CLI
+// command's before/after measurement of what a physical-layer change
+// actually bought, at whatever phy mode / speed / PIO frequency is
+// currently active.
+bool swd_bench(uint32_t *us, swd_bench_split_t *split) {
+    swd_bench_split_t sp = {0, 0, 0};
+    absolute_time_t t0 = get_absolute_time();
+
+    bool ok = swd_connect_ex(true);
+    absolute_time_t t1 = get_absolute_time();
+    sp.connect_us = (uint32_t)absolute_time_diff_us(t0, t1);
+
+    if (ok) {
+        ahb_initialized = false;
+        ok = swd_init_ahb_ap_ex(true);
+        // Must mirror swd_race_once(): swd_init_ahb_ap_ex() does NOT set
+        // this itself. Forgetting it made swd_read_mem() below take the
+        // !ahb_initialized branch and re-run the whole bring-up through
+        // swd_init_ahb_ap() -- the fast=false variant, with its
+        // unconditional sleep_ms(1) -- inside the read phase. That single
+        // missing line was ~1.2ms of the "frequency-independent floor"
+        // this benchmark was built to explain, and it was measuring the
+        // benchmark, not the race path (which sets this correctly).
+        if (ok)
+            ahb_initialized = true;
+    }
+    absolute_time_t t2 = get_absolute_time();
+    sp.ahb_us = (uint32_t)absolute_time_diff_us(t1, t2);
+
+    if (ok) {
+        uint32_t words[2] = {0, 0};
+        ok = (swd_read_mem(0x00000000, words, 2) == 2);
+    }
+    absolute_time_t t3 = get_absolute_time();
+    sp.read_us = (uint32_t)absolute_time_diff_us(t2, t3);
+
+    if (us)
+        *us = (uint32_t)absolute_time_diff_us(t0, t3);
+    if (split)
+        *split = sp;
+    return ok;
+}
+
+bool swd_race_sweep(uint32_t start_us, uint32_t end_us, uint32_t step_us,
+                     uint32_t shots,
+                     uint32_t sram_base, uint32_t sram_size,
+                     uint32_t flash_base, uint32_t flash_size,
+                     swd_race_report_t *success_out) {
+    if (step_us == 0 || end_us < start_us || shots == 0 ||
+        shots > SWD_RACE_SWEEP_MAX_SHOTS)
+        return false;
+
+    uint32_t n_points = (end_us - start_us) / step_us + 1;
+    if (n_points > SWD_RACE_SWEEP_MAX_POINTS)
+        return false;
+    uint32_t total = n_points * shots;  // bounded by the two caps above
+
+    uint32_t no_dp = 0, dp_only = 0, mem_blocked = 0, perturbed = 0;
+    uint32_t done = 0;
+    uint32_t last_print_ms = to_ms_since_boot(get_absolute_time());
+
+    for (uint32_t i = 0; i < n_points; i++) {
+        uint32_t delay_us = start_us + i * step_us;
+
+        for (uint32_t shot = 0; shot < shots; shot++) {
+            // Rendez-vous reseau entre deux tirs : un sweep dure plusieurs
+            // minutes, pendant lesquelles chaque tir ferme une section
+            // silencieuse. Sans cette reprise, le lien TCP mourrait avant la
+            // fin. Placee ici, elle est hors de toute fenetre chronometree.
+            net_cli_pump();
+
+            // Any pending input aborts the sweep — this can run for a
+            // long time and there is no other way to interrupt it mid-run.
+            if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) {
+                printf("\r\n[SWD RACE] aborted by user at delay=%luus (%lu/%lu)\r\n",
+                       (unsigned long)delay_us, (unsigned long)done, (unsigned long)total);
+                return false;
+            }
+
+            swd_race_report_t rep;
+            bool success = swd_race_once(delay_us, sram_base, sram_size,
+                                          flash_base, flash_size, &rep);
+            done++;
+
+            if (success) {
+                printf("\r\n*** SWD RACE SUCCESS at delay=%luus (shot %lu/%lu) "
+                       "SP=0x%08lX PC=0x%08lX ***\r\n",
+                       (unsigned long)delay_us, (unsigned long)(shot + 1),
+                       (unsigned long)shots, (unsigned long)rep.sp, (unsigned long)rep.pc);
+                printf("*** TARGET LEFT POWERED + CONNECTED "
+                       "-- dump it now, do not reset or power-cycle ***\r\n");
+                if (success_out) *success_out = rep;
+                return true;
+            }
+
+            switch (rep.result) {
+                case SWD_RACE_DP_ONLY:     dp_only++;     break;
+                case SWD_RACE_MEM_BLOCKED: mem_blocked++; break;
+                case SWD_RACE_PERTURBED:   perturbed++;   break;
+                case SWD_RACE_NO_DP:
+                default:                   no_dp++;       break;
+            }
+        }
+
+        uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+        if (now_ms - last_print_ms >= 500 || i == n_points - 1) {
+            printf("\r[SWD RACE] delay=%luus (%lu/%lu) no_dp=%lu dp_only=%lu "
+                   "blocked=%lu perturbed=%lu",
+                   (unsigned long)delay_us, (unsigned long)done, (unsigned long)total,
+                   (unsigned long)no_dp, (unsigned long)dp_only,
+                   (unsigned long)mem_blocked, (unsigned long)perturbed);
+            last_print_ms = now_ms;
+        }
+    }
+
+    printf("\r\n[SWD RACE] sweep complete, no success. no_dp=%lu dp_only=%lu "
+           "blocked=%lu perturbed=%lu\r\n",
+           (unsigned long)no_dp, (unsigned long)dp_only,
+           (unsigned long)mem_blocked, (unsigned long)perturbed);
+    return false;
 }
 
 uint8_t swd_get_last_ack(void) {
@@ -870,10 +1331,439 @@ bool swd_detect(uint32_t *cpuid_out, uint32_t *dbg_idcode_out) {
     if (cpuid_out)
         mem_read32(CPUID, cpuid_out);
 
-    if (dbg_idcode_out)
-        mem_read32(DBG_IDCODE, dbg_idcode_out);
+    // DBG_IDCODE (0xE0042000) is an STM32-specific debug ID register, not
+    // mapped on other Cortex-M families. Read it when the target is still
+    // unknown (STM32 auto-detection in progress, command_parser.c's
+    // "SWD IDCODE" handler) or already known to be an STM32; for a target
+    // explicitly set to something else (e.g. BAT32G135), report "unknown"
+    // instead of reading an address that has no defined meaning there.
+    if (dbg_idcode_out) {
+        extern target_type_t target_get_type(void);
+        target_type_t tt = target_get_type();
+        if (tt == TARGET_NONE || target_is_stm32(tt))
+            mem_read32(DBG_IDCODE, dbg_idcode_out);
+        else
+            *dbg_idcode_out = 0;
+    }
 
     return true;
+}
+
+// --- BAT32G135 flash controller (FMC) ---
+//
+// Transcribed from Cmsemicon's OWN driver, Driver/src/flash.c of the
+// official CMSIS pack (Cmsemicon.BAT32G135.1.0.4.pack, SVD confirms
+// FMC base 0x40020000). That source is authoritative and corrects
+// 07_BAT32G135_FAULTYCAT.md §7.4 on several points:
+//
+//   * ★ Programming granularity is a BYTE, not a 32-bit word. The vendor's
+//     ProgramPage() walks a uint8_t* and re-arms FLOPMD1/FLOPMD2 before
+//     EVERY byte. The doc's "Program (mot 32 bits)" is wrong. This is what
+//     lets us set OCDEN alone without disturbing the WDT/LVD/HOCO bytes
+//     sharing its word.
+//   * FLERMD is 0x08 for chip erase (doc right) but ALSO 0x10 for sector
+//     erase (doc silent) — and must be restored to 0x00 afterwards.
+//   * FLPROT is 0xF1 to unlock and 0xF0 to re-lock (doc gave only 0xF1).
+//   * The six timing registers (FLCERCNT/FLSERCNT/FLNVSCNT/FLPROCNT/
+//     FLPRVCNT/FLERVCNT) are never touched by the vendor driver — their
+//     resets are usable. Do not program them.
+//
+// ⚠ Sector erase is deliberately NOT implemented. OCDEN lives at
+// 0x000000C3, inside sector 0, which also holds the reset vector table.
+#define FMC_FLSTS       0x40020000u
+#define FMC_FLOPMD1     0x40020004u
+#define FMC_FLOPMD2     0x40020008u
+#define FMC_FLERMD      0x4002000Cu
+#define FMC_FLPROT      0x40020020u
+
+#define FMC_FLSTS_OVF   (1u << 0)
+#define FMC_FLSTS_EVF   (1u << 2)
+
+#define FMC_FLPROT_UNLOCK  0xF1u
+#define FMC_FLPROT_LOCK    0xF0u
+#define FMC_FLERMD_CHIP    0x08u
+#define FMC_FLERMD_SECTOR  0x10u   /* vendor Driver/src/flash.c; absent from doc §7.4 */
+#define BAT32_DATA_FLASH_BASE 0x00500000u
+#define FMC_FLERMD_NONE    0x00u
+
+// Byte-width AHB-AP write. Models mem_write16() above: CSW SIZE=BYTE (0)
+// and the data byte placed in the lane selected by addr[1:0].
+static bool mem_write8(uint32_t addr, uint8_t val) {
+    if (!ahb_initialized) {
+        if (!swd_init_ahb_ap())
+            return false;
+        ahb_initialized = true;
+    }
+
+    uint32_t csw = ap_csw_base | CSW_ADDRINC_SINGLE;  // SIZE field 0 = byte
+    if (!swd_write_ap(0, AP_CSW, csw))
+        return false;
+    if (!swd_write_ap(0, AP_TAR, addr))
+        return false;
+
+    uint32_t drw = (uint32_t)val << ((addr & 3u) * 8u);
+    if (!swd_write_ap(0, AP_DRW, drw))
+        return false;
+
+    uint32_t dummy;
+    swd_read_dp(DP_RDBUFF, &dummy);
+
+    csw = ap_csw_base | CSW_SIZE_WORD | CSW_ADDRINC_SINGLE;
+    swd_write_ap(0, AP_CSW, csw);
+    return true;
+}
+
+// Poll FLSTS.OVF, then clear it. Bounded: a flash op that never reports
+// completion must not wedge the CLI. Datasheet timings ([DS] §6.9.1):
+// byte/word program 24-30us, chip erase 20-40ms.
+static bool fmc_wait_ovf(uint32_t timeout_ms) {
+    uint32_t deadline = to_ms_since_boot(get_absolute_time()) + timeout_ms;
+    for (;;) {
+        uint32_t sts = 0;
+        if (!mem_read32(FMC_FLSTS, &sts))
+            return false;
+        if (sts & FMC_FLSTS_OVF) {
+            mem_write32(FMC_FLSTS, FMC_FLSTS_OVF);  // W1C
+            return true;
+        }
+        if (to_ms_since_boot(get_absolute_time()) > deadline)
+            return false;
+        sleep_us(50);
+    }
+}
+
+bool swd_bat32_flash_program(uint32_t addr, const uint8_t *data, uint32_t len) {
+    if (len == 0)
+        return false;
+
+    // Clear any latched sticky error before anything else. At protection
+    // Level 1 a flash read comes back FAULT (ACK=0x4), which latches
+    // STICKYERR in CTRL/STAT and makes EVERY subsequent AP transaction
+    // fail until DP_ABORT clears it. Without this, a caller that probed
+    // the target first (the CLI reads the byte back to show before/after)
+    // poisons the link and the halt below fails for a reason that has
+    // nothing to do with the flash controller — which is exactly how the
+    // first Level 1 recovery attempt was misdiagnosed.
+    swd_clear_errors();
+
+    // Halt the core first. The vendor driver runs from RAM with interrupts
+    // off precisely because the CPU must not fetch from flash while flash
+    // is being programmed; over SWD the equivalent guarantee is a halted
+    // core. Without this the sensor's own firmware keeps executing out of
+    // the array we are writing.
+    if (!swd_halt()) {
+        printf("[BAT32] program: core halt failed — refusing to write\r\n");
+        return false;
+    }
+
+    if (!mem_write32(FMC_FLPROT, FMC_FLPROT_UNLOCK))
+        return false;
+
+    bool ok = true;
+    for (uint32_t i = 0; i < len && ok; i++) {
+        // FLOPMD1/FLOPMD2 must be re-armed before EACH byte (vendor
+        // ProgramPage does exactly this inside its loop).
+        ok = mem_write32(FMC_FLOPMD1, 0xAAu) &&
+             mem_write32(FMC_FLOPMD2, 0x55u) &&
+             mem_write8(addr + i, data[i]) &&
+             fmc_wait_ovf(50);
+        if (!ok)
+            printf("[BAT32] program: failed at offset %lu (addr 0x%08X)\r\n",
+                   (unsigned long)i, (unsigned)(addr + i));
+    }
+
+    mem_write32(FMC_FLPROT, FMC_FLPROT_LOCK);  // re-lock even on failure
+    return ok;
+}
+
+// One erase pass. `trigger` is the dummy-write address, and it is what
+// selects WHICH array gets erased -- see swd_bat32_chip_erase() below.
+static bool bat32_erase_pass(uint32_t trigger) {
+    // Order per the vendor EraseChip(): FLERMD first, then FLPROT, then
+    // the FLOPMD pair (0x55/0xAA — the INVERSE of the program pair), then
+    // a dummy write to trigger it.
+    bool ok = mem_write32(FMC_FLERMD, FMC_FLERMD_CHIP) &&
+              mem_write32(FMC_FLPROT, FMC_FLPROT_UNLOCK) &&
+              mem_write32(FMC_FLOPMD1, 0x55u) &&
+              mem_write32(FMC_FLOPMD2, 0xAAu) &&
+              mem_write32(trigger, 0xFFFFFFFFu) &&
+              fmc_wait_ovf(500);   // [DS]: chip erase 20-40ms, wide margin
+
+    mem_write32(FMC_FLERMD, FMC_FLERMD_NONE);
+    mem_write32(FMC_FLPROT, FMC_FLPROT_LOCK);
+    return ok;
+}
+
+// Sector erase — the vendor driver's FLERMD=0x10, which this firmware never
+// wired up. It is the only way to blank the DATA flash: the chip erase
+// (FLERMD=0x08) leaves that array untouched no matter which address triggers
+// it (measured 2026-09-02, both 0x00000000 and 0x00500000).
+//
+// `addr` selects the sector: any address inside it. Erasing a sector of CODE
+// flash is equally possible and equally destructive, hence CONFIRM at the CLI.
+bool swd_bat32_sector_erase(uint32_t addr) {
+    swd_clear_errors();
+
+    if (!swd_halt())
+        printf("[BAT32] sector erase: core halt failed, proceeding anyway\r\n");
+
+    bool ok = mem_write32(FMC_FLERMD, FMC_FLERMD_SECTOR) &&
+              mem_write32(FMC_FLPROT, FMC_FLPROT_UNLOCK) &&
+              mem_write32(FMC_FLOPMD1, 0x55u) &&
+              mem_write32(FMC_FLOPMD2, 0xAAu) &&
+              mem_write32(addr, 0xFFFFFFFFu) &&
+              fmc_wait_ovf(100);   // [DS]: sector erase 4-5 ms, wide margin
+
+    mem_write32(FMC_FLERMD, FMC_FLERMD_NONE);
+    mem_write32(FMC_FLPROT, FMC_FLPROT_LOCK);
+    return ok;
+}
+
+// ★ Measured 2026-09-02: this erases the CODE flash ONLY. After a chip erase
+// that reported success, 0x00500008 still held the sensor's pairing record
+// (AA 55 AA 55 "device_id"), byte-identical to the pre-erase dump -- and
+// re-running the same sequence with the trigger write aimed at 0x00500000
+// changed nothing either. The data flash array is simply outside what
+// FLERMD=0x08 covers; only FLERMD=0x10 (swd_bat32_sector_erase) reaches it.
+// The firmware's own "code + data flash" message and doc §7.4 were both
+// wrong on this until now.
+bool swd_bat32_chip_erase(void) {
+    swd_clear_errors();   // same sticky-error trap as in program(), above
+
+    // Halting is preferred but NOT required here: chip erase is the only
+    // documented way out of Level 1, and at Level 1 the core often cannot
+    // be halted at all. Refusing on a failed halt would make the escape
+    // hatch unusable exactly when it is needed. Erasing under a running
+    // core is acceptable because the whole array is going away regardless.
+    if (!swd_halt())
+        printf("[BAT32] chip erase: core halt failed, proceeding anyway\r\n");
+
+    // One pass, triggered in code flash. A second pass aimed at the data
+    // flash was tried and erased nothing, so it is not kept: this verb does
+    // what it does, and SECTORERASE is what blanks 0x500000.
+    //
+    // Deliberately NOT chaining the three SECTORERASE calls here. Escaping
+    // Level 1 costs a chip erase, and the part happens to keep its data
+    // flash through it — destroying that on the caller's behalf would throw
+    // away the pairing the hardware was willing to preserve.
+    bool ok = bat32_erase_pass(0x00000000u);
+    if (!ok)
+        printf("[BAT32] chip erase: code flash pass failed\r\n");
+    return ok;
+}
+
+// --- BAT32G135 Level 1 bypass: read flash THROUGH the core ---
+//
+// Rationale, all three premises measured on hardware (see §2bis of
+// TPLink_Tapo/07_BAT32G135_FAULTYCAT.md):
+//   1. at Level 1 SRAM stays fully readable — the protection only ever
+//      covered "données flash" (§2.3), which turns out to be literal;
+//   2. the core can still be halted at Level 1;
+//   3. the core itself may read flash — it executes from it. The
+//      protection targets the DEBUGGER's view, not the CPU's.
+// So: park a tiny copier in SRAM, point the core at it, let IT read the
+// flash, and read the result back out of SRAM. No fault injection.
+//
+// ⚠ UNTESTED. Premise (1) and (2) are measured; what is NOT yet verified
+// is that SRAM is WRITABLE at Level 1, that PC/SP writes take, and that
+// this ARMv6-M will execute from SRAM. Any of those failing sinks it —
+// the function reports which one rather than guessing.
+
+#define BAT32_PAYLOAD_ADDR  0x20000000u
+#define BAT32_PAYLOAD_BUF   0x20000020u
+#define BAT32_PAYLOAD_SP    0x20002000u
+#define BAT32_PAYLOAD_MAXW  1024u          /* 4 KB per pass */
+
+bool swd_bat32_ram_read(uint32_t src, uint32_t words, uint32_t *out) {
+    if (!out || words == 0 || words > BAT32_PAYLOAD_MAXW)
+        return false;
+    // `ldr r3,[r0]` faults on a misaligned address on ARMv6-M, and that
+    // fault would surface below as "payload did not reach BKPT" -- a
+    // message that reads as "the bypass does not work" when in fact the
+    // argument is wrong.
+    if (src & 3u) {
+        printf("[BAT32-RAM] source 0x%08X is not word-aligned\r\n", (unsigned)src);
+        return false;
+    }
+
+    swd_clear_errors();
+    if (!swd_halt()) {
+        printf("[BAT32-RAM] core halt failed\r\n");
+        return false;
+    }
+
+    // Thumb-16 copier, 4 words. r0=src r1=dst r2=count:
+    //   6803  ldr  r3,[r0]      600B  str  r3,[r1]
+    //   3004  adds r0,#4        3104  adds r1,#4
+    //   3A01  subs r2,#1        D1F9  bne  -14 (back to ldr)
+    //   BE00  bkpt #0           BE00  bkpt #0
+    static const uint32_t payload[4] = {
+        0x600B6803u, 0x31043004u, 0xD1F93A01u, 0xBE00BE00u
+    };
+    if (swd_write_mem(BAT32_PAYLOAD_ADDR, payload, 4) != 4) {
+        printf("[BAT32-RAM] SRAM not writable — payload injection refused\r\n");
+        return false;
+    }
+    uint32_t check[4] = {0, 0, 0, 0};
+    if (swd_read_mem(BAT32_PAYLOAD_ADDR, check, 4) != 4 ||
+        check[0] != payload[0] || check[3] != payload[3]) {
+        printf("[BAT32-RAM] payload readback mismatch (%08X %08X)\r\n",
+               (unsigned)check[0], (unsigned)check[3]);
+        return false;
+    }
+
+    bool ok = swd_write_core_reg(13, BAT32_PAYLOAD_SP) &&
+              swd_write_core_reg(0, src) &&
+              swd_write_core_reg(1, BAT32_PAYLOAD_BUF) &&
+              swd_write_core_reg(2, words) &&
+              swd_write_core_reg(15, BAT32_PAYLOAD_ADDR | 1u);   // Thumb bit
+    if (!ok) {
+        printf("[BAT32-RAM] core register write failed\r\n");
+        return false;
+    }
+    uint32_t xpsr = 0;
+    swd_read_core_reg(16, &xpsr);
+    xpsr |= (1u << 24);                    // T bit — ARMv6-M has no ARM state
+    swd_write_core_reg(16, xpsr);
+
+    // TRCENA + VC_HARDERR. The vector catch is what makes a failure
+    // legible: without it "this core will not execute from SRAM" and "the
+    // payload hung" are the same 500 ms timeout, whereas a caught hard
+    // fault halts at once and PC says where it died.
+    uint32_t demcr = (1u << 24) | DEMCR_VC_HARDERR;
+    swd_write_mem(DEMCR, &demcr, 1);
+
+    if (!swd_resume()) {
+        printf("[BAT32-RAM] resume failed\r\n");
+        return false;
+    }
+
+    // Wait for the BKPT to halt us again. 4 KB at a few MHz core clock is
+    // sub-millisecond; be generous but bounded.
+    bool halted = false, lockup = false;
+    uint32_t dhcsr = 0;
+    uint32_t start = to_ms_since_boot(get_absolute_time());
+    while (to_ms_since_boot(get_absolute_time()) - start < 500) {
+        if (mem_read32(DHCSR, &dhcsr)) {
+            if (dhcsr & (1u << 17)) { halted = true; break; }   // S_HALT
+            if (dhcsr & (1u << 19)) { lockup = true; break; }   // S_LOCKUP
+        }
+        sleep_us(200);
+    }
+    if (!halted) {
+        printf("[BAT32-RAM] payload did not reach BKPT (%s, DHCSR=0x%08X)\r\n",
+               lockup ? "core LOCKED UP" : "core still running", (unsigned)dhcsr);
+        swd_halt();
+        return false;
+    }
+
+    // WHERE it stopped decides whether the buffer holds flash or garbage.
+    // A clean finish halts ON one of the two trailing BKPTs (PC points at
+    // the BKPT, not past it): payload+0x0C or +0x0E. Any other PC means the
+    // copier faulted or never ran, and the buffer is stale SRAM.
+    uint32_t pc = 0;
+    if (!swd_read_core_reg(15, &pc)) {
+        // Never fall through to the buffer here: a buffer nobody vouched
+        // for is the one failure that LOOKS like success. At Level 1 the
+        // SRAM it would return plausibly holds `.data` copied from flash
+        // at boot, i.e. flash-derived bytes the payload never fetched.
+        printf("[BAT32-RAM] PC unreadable after halt -- refusing the buffer\r\n");
+        return false;
+    }
+    if (pc < BAT32_PAYLOAD_ADDR + 0x0Cu || pc > BAT32_PAYLOAD_ADDR + 0x0Eu) {
+        uint32_t dfsr = 0;
+        mem_read32(0xE000ED30u, &dfsr);   // DFSR: bit1 BKPT, bit3 VCATCH
+        printf("[BAT32-RAM] halted at PC=0x%08X, not the trailing BKPT "
+               "(DFSR=0x%08X) -- buffer would not be flash data\r\n",
+               (unsigned)pc, (unsigned)dfsr);
+        return false;
+    }
+
+    return swd_read_mem(BAT32_PAYLOAD_BUF, out, words) == words;
+}
+
+// --- BAT32G135 operations (read-only) ---
+
+bool swd_bat32_read_options(const bat32_target_info_t *info) {
+    // Cluster 0 option bytes (0x000000C0-C3): one aligned word.
+    // Byte layout (little-endian, [UM] §28.2): WDT | LVD | HOCO | OCDEN.
+    uint32_t word0 = 0;
+    bool have0 = mem_read32(info->ocden_addr & ~0x3u, &word0);
+    uint8_t ocden0 = (uint8_t)(word0 >> 24);
+    if (have0) {
+        printf("Option bytes cluster 0 (0x%08X) = 0x%08X\r\n",
+               (unsigned)(info->ocden_addr & ~0x3u), (unsigned)word0);
+        printf("  OCDEN (0x%08X) = 0x%02X\r\n", (unsigned)info->ocden_addr, ocden0);
+    } else {
+        printf("Option bytes cluster 0: unreadable (code flash inaccessible "
+               "at the current protection level)\r\n");
+    }
+
+    // Cluster 1 (0x000001C0-C3) — the boot-swap mirror consulted INSTEAD
+    // of cluster 0 whenever BTEN=0 ([UM] §5.1/§28.1).
+    uint32_t word1 = 0;
+    bool have1 = mem_read32(info->ocden_addr_swap & ~0x3u, &word1);
+    uint8_t ocden1 = (uint8_t)(word1 >> 24);
+    if (have1) {
+        printf("Option bytes cluster 1 / boot-swap mirror (0x%08X) = 0x%08X\r\n",
+               (unsigned)(info->ocden_addr_swap & ~0x3u), (unsigned)word1);
+        printf("  OCDEN (0x%08X) = 0x%02X\r\n", (unsigned)info->ocden_addr_swap, ocden1);
+    }
+
+    // OCDM (data flash byte 0x500004) and BTEN (bit 0 of byte 0x500005) —
+    // same 32-bit word, [UM] §28.3 fig. 28-4 / §5.1.
+    uint32_t ocdm_word = 0;
+    bool have_ocdm = mem_read32(info->ocdm_bten_addr, &ocdm_word);
+    uint8_t ocdm = (uint8_t)(ocdm_word & 0xFF);
+    bool bten = ((ocdm_word >> 8) & 1) != 0;
+    if (have_ocdm) {
+        printf("OCDM (0x%08X) = 0x%02X\r\n", (unsigned)info->ocdm_bten_addr, ocdm);
+        printf("BTEN (0x%08X) = %u (boot-swap %s)\r\n",
+               (unsigned)(info->ocdm_bten_addr + 1), bten,
+               bten ? "disabled" : "ACTIVE -- cluster 1 governs, not cluster 0");
+    } else {
+        printf("OCDM/BTEN: unreadable (data flash inaccessible at the "
+               "current protection level)\r\n");
+    }
+
+    // SWDIS — the third, runtime-only lock (DBGSTOPCR bit 24). 0 at reset;
+    // this is what the "reset-release race" (SWD RACE) races against.
+    uint32_t dbgstopcr = 0;
+    bool have_dbg = mem_read32(info->dbgstopcr_addr, &dbgstopcr);
+    if (have_dbg) {
+        bool swdis = (dbgstopcr & BAT32_DBGSTOPCR_SWDIS) != 0;
+        printf("DBGSTOPCR (0x%08X) = 0x%08X  SWDIS=%u (%s)\r\n",
+               (unsigned)info->dbgstopcr_addr, (unsigned)dbgstopcr, swdis,
+               swdis ? "SWD DISABLED by firmware" : "SWD enabled");
+    }
+
+    // Deduced protection level, [UM] §28.3 fig. 28-4 (doc §2.3). If BTEN
+    // reads as active (0) and cluster 1 is readable, that cluster is the
+    // one that actually governs — use it instead of cluster 0.
+    if (have0 || have1) {
+        bool use_swap = have_ocdm && !bten && have1;
+        uint8_t ocden = use_swap ? ocden1 : ocden0;
+        // Unknown OCDM never falsely reads as Level 2 (0x3C) — only a
+        // confirmed match downgrades from "Level 1 assumed" to Level 2.
+        uint8_t ocdm_for_level = have_ocdm ? ocdm : (uint8_t)(~BAT32_OCDM_LEVEL2);
+        bat32_prot_level_t level = bat32_decode_level(ocden, ocdm_for_level);
+        const char *level_str =
+            level == BAT32_PROT_LEVEL0 ? "Level 0 (flash open)" :
+            level == BAT32_PROT_LEVEL1 ? "Level 1 (chip-erase only)" :
+                                          "Level 2 (no flash access via debugger)";
+        printf("Deduced protection level: %s (from cluster %s, OCDEN=0x%02X%s)\r\n",
+               level_str, use_swap ? "1 [boot-swap active]" : "0",
+               ocden, have_ocdm ? "" : ", OCDM unknown");
+        if (use_swap) {
+            printf("  NOTE: boot-swap is ACTIVE -- fault/write target is "
+                   "0x%08X, NOT 0x%08X\r\n",
+                   (unsigned)info->ocden_addr_swap, (unsigned)info->ocden_addr);
+        }
+    } else {
+        printf("Could not determine protection level (option bytes unreadable)\r\n");
+    }
+
+    return have0 || have1 || have_ocdm || have_dbg;
 }
 
 // --- STM32 flash operations ---

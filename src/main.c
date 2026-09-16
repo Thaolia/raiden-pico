@@ -4,7 +4,12 @@
 #include "command_parser.h"
 #include "glitch.h"
 #include "config.h"
+#include "pio_alloc.h"
+#include "net_cli.h"
 #include <stdio.h>
+#if RAIDEN_HAS_WIFI
+#include "pico/cyw43_arch.h"
+#endif
 
 // Forward declarations for UART modules
 extern void chipshot_uart_init(void);
@@ -12,8 +17,26 @@ extern void chipshot_uart_process(void);
 extern void target_uart_process(void);
 extern void target_init(void);
 
-// LED pin for status indication
-#define LED_PIN 25
+// LED d'etat.
+//
+// ATTENTION : sur Pico 2 W, GP25 n'est PAS la LED, c'est le chip-select du
+// bus SPI vers le module Wi-Fi. Le piloter en GPIO tue la liaison CYW43 --
+// et comme pico2_w.h ne definit deliberement aucun PICO_DEFAULT_LED_PIN
+// ("LED is on Wireless chip"), un `#define LED_PIN 25` en dur compilerait
+// sans le moindre avertissement. La LED passe donc par le module Wi-Fi, ce
+// qui impose que cyw43_arch_init() ait deja reussi avant tout allumage.
+#if defined(CYW43_WL_GPIO_LED_PIN)
+  #define RAIDEN_LED_INIT()  ((void)0)
+  #define RAIDEN_LED_SET(v)  cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, (v))
+#elif defined(PICO_DEFAULT_LED_PIN)
+  #define RAIDEN_LED_INIT()  do { gpio_init(PICO_DEFAULT_LED_PIN);          \
+                                  gpio_set_dir(PICO_DEFAULT_LED_PIN,        \
+                                               GPIO_OUT); } while (0)
+  #define RAIDEN_LED_SET(v)  gpio_put(PICO_DEFAULT_LED_PIN, (v))
+#else
+  #define RAIDEN_LED_INIT()  ((void)0)
+  #define RAIDEN_LED_SET(v)  ((void)(v))
+#endif
 
 int main() {
     // Initialize standard I/O
@@ -25,10 +48,18 @@ int main() {
     // Send early test message
     printf("Raiden Pico starting...\n");
 
-    // Initialize LED
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, 1);  // Turn on LED
+    // Reserver les ressources PIO cablees en dur AVANT toute initialisation
+    // qui pourrait en allouer (cyw43_arch_init au premier chef). Voir
+    // src/pio_alloc.c : sans cela le pilote Wi-Fi vole sa state machine a
+    // swd_phy, et rien ne le signale jusqu'a la premiere commande SWD.
+    pio_resources_reserve();
+
+    // Wi-Fi (Pico 2 W) : apres la reservation PIO, et AVANT le premier
+    // allumage de LED -- sur cette carte la LED passe par le module Wi-Fi.
+    net_cli_init();
+
+    RAIDEN_LED_INIT();
+    RAIDEN_LED_SET(1);
 
     printf("LED initialized\n");
 
@@ -52,9 +83,9 @@ int main() {
 
     // Blink LED to indicate ready
     for (int i = 0; i < 3; i++) {
-        gpio_put(LED_PIN, 0);
+        RAIDEN_LED_SET(0);
         sleep_ms(100);
-        gpio_put(LED_PIN, 1);
+        RAIDEN_LED_SET(1);
         sleep_ms(100);
     }
 
@@ -98,6 +129,10 @@ int main() {
 
         // Update glitch flags
         glitch_update_flags();
+
+        // Service reseau : seul endroit ou lwIP et le pilote Wi-Fi
+        // travaillent. Sans effet (et sans coût) sur une carte sans Wi-Fi.
+        net_cli_poll();
 
         // Small delay to prevent busy waiting
         sleep_us(100);

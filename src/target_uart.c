@@ -3,6 +3,7 @@
 #include "swd.h"
 #include "stm32_breakpoints.h"
 #include "glitch.h"
+#include "net_cli.h"
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
@@ -539,6 +540,15 @@ bool target_enter_bootloader(uint32_t baud, uint32_t crystal_khz) {
             }
             break;
         }
+
+        case TARGET_BAT32:
+            // No documented UART ISP bootloader on this part (doc §5.2:
+            // exhaustive search of the 746-page user manual + datasheet
+            // found none) -- SWD is the only supported path.
+            uart_cli_send("ERROR: BAT32G135 has no documented UART ISP bootloader "
+                          "(TARGET SYNC/BOOTLOADER not supported) -- use SWD RACE / "
+                          "SWD CONNECTRST / SWD READ instead\r\n");
+            return false;
 
         default:
             uart_cli_send("ERROR: Unknown target type\r\n");
@@ -1549,8 +1559,20 @@ static void power_glitch_once(uint32_t thresh, uint32_t min_width_us,
 
     uint32_t adc_log_count = 0;
 
+    // Fenetre critique : de la coupure du rail jusqu'a sa restauration.
+    //
+    // Le bloc englobant existe uniquement pour delimiter la section
+    // silencieuse : pendant cette boucle ADC, aucune interruption Wi-Fi ne
+    // doit s'intercaler. Le commentaire de nrst_irq_arm() plus haut dans ce
+    // fichier documente qu'un simple dispatcher partage de quelques
+    // instructions suffisait deja a faire rater la fenetre de restauration.
+    // Sur une carte sans Wi-Fi, NET_QUIET_SECTION se reduit a rien.
+    uint64_t t0 = 0;
+    {
+    NET_QUIET_SECTION;
+
     // Drive single power pin low
-    uint64_t t0 = time_us_64();
+    t0 = time_us_64();
     gpio_clr_mask(1u << POWER_PIN1);
 
     // Poll ADC until voltage drops below threshold
@@ -1586,6 +1608,11 @@ static void power_glitch_once(uint32_t thresh, uint32_t min_width_us,
     gpio_set_dir(POWER_PIN3, GPIO_OUT);
     gpio_set_mask(POWER_MASK);
     result->glitch_us = (uint32_t)(time_us_64() - t0);
+
+    }  // fin de la section silencieuse : le rail est restaure.
+       // La surveillance nRST qui suit dure 50 ms et n'est pas critique a la
+       // microseconde -- l'y inclure affamerait le lien reseau sur une
+       // campagne de plusieurs milliers de tirs.
 
     // Monitor nRST for 50ms (polling + IRQ backup)
     for (int i = 0; i < 5000; i++) {

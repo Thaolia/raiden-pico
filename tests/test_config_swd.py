@@ -55,7 +55,7 @@ class TestSWDConnect:
         r = swd_target.cmd("SWD")
         for sub in ["CONNECT", "CONNECTRST", "DISCONNECT", "READ", "WRITE",
                      "FILL", "HALT", "RESUME", "RESET", "RDP", "OPT",
-                     "REGS", "SETREG", "SPEED", "BPTEST"]:
+                     "REGS", "SETREG", "SPEED", "BPTEST", "RACE"]:
             assert sub in r, f"SWD help missing: {sub}"
 
     def test_prefix_ambiguous(self, swd_target):
@@ -386,3 +386,91 @@ class TestTriggerFire:
         assert "ARMED" in r, "GPIO trigger did not arm properly"
 
         self._cleanup(cli)
+
+
+# ── SWD RACE (reset-release race) — happy path, needs a live target ──
+# The pure-parsing error paths (bad delay/sweep args, PHY gate) don't
+# touch hardware and are covered without wiring in
+# test_config_none.py::TestSWDRaceErrors. This class exercises the actual
+# nRST-assert/release + connect sequence against a live SW-DP, over the
+# PIO physical layer (SWD PHY PIO) -- SWD RACE no longer accepts SPEED 0,
+# see the v0.10 CHANGELOG entry and §0bis of 07_BAT32G135_FAULTYCAT.md for
+# why (SPEED 0 mis-samples on a flying-wire bench; it isn't just slow).
+
+class TestSWDRace:
+
+    def test_race_single_shot_runs(self, swd_target):
+        """No BAT32 is wired, so this can never reach SUCCESS (TARGET
+        stays STM32F1 -> bat32_get_target_info() returns NULL -> the
+        plausibility check is disabled) — it only confirms the
+        reset-release + connect sequence runs end-to-end against a real
+        SW-DP without wedging the CLI or the SWD state machine, and that
+        the target is still reachable normally afterward.
+        """
+        cli = swd_target
+        cli.cmd("TARGET STM32F1")
+        cli.cmd("SWD PHY PIO 2500")
+        r = cli.cmd("SWD RACE 0", wait=2)
+        assert "RACE delay=" in r
+        assert any(cat in r for cat in
+                   ("no_dp", "dp_only", "mem_blocked", "perturbed", "SUCCESS"))
+
+        cli.cmd("SWD PHY BITBANG")  # restore default
+        r2 = cli.cmd("SWD CONNECT")
+        assert "Connected" in r2
+
+    def test_race_tiny_sweep_runs(self, swd_target):
+        """A small, bounded sweep (3 delay points x 1 shot) — checks the
+        sweep loop itself runs to completion and reports a summary, not
+        that it finds anything (SUCCESS is unreachable, see above)."""
+        cli = swd_target
+        cli.cmd("TARGET STM32F1")
+        cli.cmd("SWD PHY PIO 2500")
+        r = cli.cmd("SWD RACE SWEEP 0 20 10", wait=5)
+        assert ("sweep complete" in r.lower() or
+                "ERROR: SWD RACE SWEEP finished without a SUCCESS" in r)
+
+        cli.cmd("SWD PHY BITBANG")
+        r2 = cli.cmd("SWD CONNECT")
+        assert "Connected" in r2
+
+
+# ── TARGET BAT32 refusal paths (no write/erase path exists) ──────────
+# Uses the live STM32 SW-DP so auto-connect succeeds, then overrides the
+# software-selected TARGET to BAT32 to reach the BAT32-specific gates —
+# these check the SOFTWARE target type, not what chip is actually wired.
+
+class TestTargetBat32Refusals:
+
+    def test_bat32_rdp_refused(self, swd_target):
+        cli = swd_target
+        cli.cmd("TARGET BAT32")
+        r = cli.cmd("SWD RDP")
+        assert "ERROR" in r and "RDP register" in r
+        cli.cmd("TARGET STM32F1")  # restore for later tests in the module
+
+    def test_bat32_flash_erase_refused(self, swd_target):
+        cli = swd_target
+        cli.cmd("TARGET BAT32")
+        r = cli.cmd("SWD FLASH ERASE 0")
+        assert "ERROR" in r and "read-only" in r
+        cli.cmd("TARGET STM32F1")
+
+    def test_bat32_opt_runs(self, swd_target):
+        """SWD OPT under TARGET BAT32 against a real (STM32) SW-DP.
+
+        The addresses it reads (0xC0/0x1C0 option-byte clusters,
+        0x500004 data flash, 0x4001B004 DBGSTOPCR) are not BAT32 option
+        bytes on this chip — 0xC0/0x1C0 alias valid low STM32 flash so
+        they should read fine, but 0x500004 is outside any STM32F1
+        region and may bus-fault, which can leave the AP in a state
+        where the DBGSTOPCR read after it fails too. So this only
+        asserts the command doesn't return ERROR and the first (always
+        reachable) OCDEN field prints — not that every field printed.
+        """
+        cli = swd_target
+        cli.cmd("TARGET BAT32")
+        r = cli.cmd("SWD OPT", wait=2)
+        assert "ERROR" not in r
+        assert "OCDEN" in r
+        cli.cmd("TARGET STM32F1")
