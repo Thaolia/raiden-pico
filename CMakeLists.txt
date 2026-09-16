@@ -1,10 +1,14 @@
 cmake_minimum_required(VERSION 3.13)
 
 # Board variant selection: BOARD=pico2 (default) or BOARD=xxl (Olimex RP2350-XXL)
-set(BOARD "pico2" CACHE STRING "Board variant: pico2 or xxl")
+set(BOARD "pico2" CACHE STRING "Board variant: pico2, pico2w or xxl")
 if(BOARD STREQUAL "xxl")
     set(PICO_BOARD olimex_rp2350_xxl CACHE STRING "Board type" FORCE)
     set(BOARD_NAME "Olimex RP2350-XXL")
+elseif(BOARD STREQUAL "pico2w")
+    set(PICO_BOARD pico2_w CACHE STRING "Board type" FORCE)
+    set(BOARD_NAME "Raspberry Pi Pico 2 W")
+    set(RAIDEN_HAS_WIFI ON)
 else()
     set(PICO_BOARD pico2 CACHE STRING "Board type" FORCE)
     set(BOARD_NAME "Raspberry Pi Pico 2")
@@ -83,6 +87,26 @@ target_link_libraries(raiden_pico
     hardware_adc
     hardware_dma
 )
+
+# Variante Wi-Fi : la pile reseau et la CLI TCP.
+#
+# lwip_poll et NON threadsafe_background : cette derniere execute lwIP depuis
+# une interruption de fond, c'est-a-dire exactement l'asynchronisme qu'un
+# firmware de glitch ne peut pas tolerer pres de sa fenetre de tir. En mode
+# poll, tout le travail reseau a lieu la ou nous le decidons.
+if(RAIDEN_HAS_WIFI)
+    target_sources(raiden_pico PRIVATE src/net_cli.c)
+    target_link_libraries(raiden_pico pico_cyw43_arch_lwip_poll)
+    target_compile_definitions(raiden_pico PRIVATE RAIDEN_HAS_WIFI=1)
+    if(DEFINED WIFI_SSID)
+        target_compile_definitions(raiden_pico PRIVATE
+            WIFI_SSID="${WIFI_SSID}" WIFI_PASSWORD="${WIFI_PASSWORD}")
+    endif()
+    if(DEFINED NET_CLI_TOKEN)
+        target_compile_definitions(raiden_pico PRIVATE
+            NET_CLI_TOKEN="${NET_CLI_TOKEN}")
+    endif()
+endif()
 
 # Sortie serie : USB toujours, UART0 seulement sur demande (voir l'option en
 # tete de fichier). pico_enable_stdio_uart(1) utilise PICO_DEFAULT_UART, qui
