@@ -16,6 +16,33 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
 > ce sont des notes prises au banc, elles restent le journal de développement du
 > fork.
 
+## [0.7-JLQ_26/09/18] — index d'AP explicite sur la CLI SWD
+
+### Added
+- **`SWD READ AP [<n>] <addr>` et `SWD WRITE AP [<n>] <addr> <val>`** : l'APSEL
+  devient un argument optionnel. Jusqu'ici les deux commandes appelaient
+  `swd_read_ap(0, …)` / `swd_write_ap(0, …)` en dur, ce qui rendait tout AP
+  autre que l'AHB-AP inatteignable depuis la CLI. La couche SWD, elle, savait
+  déjà viser n'importe quel AP : `swd_select_ap()` compose
+  `SELECT = (ap<<24) | (addr&0xF0)` depuis toujours. Rien n'a changé dans
+  `swd.c`.
+
+  Motivation : le **CTRL-AP du nRF52** (AP ≠ 0) est le seul AP qui répond encore
+  quand `APPROTECT` est armé — il porte à la fois l'état de protection et
+  l'effacement de masse qui le défait. `swd_read_ap()` n'exige que
+  `initialized`, pas `ahb_initialized`, donc l'état « DP seul » que laisse une
+  puce protégée suffit.
+
+- L'index se résout par le **nombre d'arguments**, jamais par la valeur :
+  `SWD READ AP 1` reste `AP[0x01]` de l'AP 0, `SWD READ AP 1 0xFC` lit l'AP 1.
+  Sans cette règle, une commande existante changerait de sens en silence.
+  `scripts/swd_regression.py` (`swd read ap 0`, `swd read ap FC`) est couvert
+  par ce choix, et la chaîne imprimée pour l'AP 0 reste `AP[0x%02X]` au
+  caractère près — ce script assert dessus. Seul un APSEL non nul, qu'aucun
+  appelant existant n'émet, obtient la forme élargie `AP%u[0x%02X]`.
+
+⚠ Non vérifié sur matériel : aucun banc n'a tourné avec cette version.
+
 ## [0.7-JLQ_26/09/16] — fork JLQ : BAT32G135, course SWD, PHY sur PIO
 
 Regroupe en une version publiable l'ensemble du travail mené en local sur les

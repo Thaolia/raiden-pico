@@ -531,7 +531,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/16\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/18\r\n");
         // Quel lien porte cette CLI : c'est la seule facon de savoir, depuis
         // l'hote, quelle variante de binaire est reellement sur la puce.
 #if RAIDEN_CONSOLE_UART
@@ -2211,7 +2211,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD RDP SET <0|1>        - Set RDP level\r\n");
             uart_cli_send("  SWD READ <addr> [n]      - Read n words (hex dump)\r\n");
             uart_cli_send("  SWD READ <region> [n]    - Read FLASH|SRAM|BOOTROM (default: full)\r\n");
-            uart_cli_send("  SWD READ DP|AP <addr>    - Read debug/access port register\r\n");
+            uart_cli_send("  SWD READ DP <addr>       - Read debug port register\r\n");
+            uart_cli_send("  SWD READ AP [<n>] <addr> - Read access port register (n = APSEL, default 0)\r\n");
             uart_cli_send("  SWD RACE [<delay_us>]    - One reset-release SWD race attempt\r\n");
             uart_cli_send("  SWD RACE SWEEP <start_us> <end_us> <step_us> [SHOTS <n>]\r\n");
             uart_cli_send("                            - Sweep the race delay, stop on first SUCCESS\r\n");
@@ -2223,7 +2224,8 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD PHY [BITBANG|PIO [<khz>]] - Get/set physical layer (default BITBANG)\r\n");
             uart_cli_send("  SWD BENCH                 - Time a fast connect+AHB-AP+read at the current phy\r\n");
             uart_cli_send("  SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
-            uart_cli_send("  SWD WRITE DP|AP <addr> <val> - Write debug/access port register\r\n");
+            uart_cli_send("  SWD WRITE DP <addr> <val> - Write debug port register\r\n");
+            uart_cli_send("  SWD WRITE AP [<n>] <addr> <val> - Write access port register (n = APSEL, def 0)\r\n");
             uart_cli_send("  SWD BPTEST               - Run FPB breakpoint self-test\r\n");
             goto api_response;
         }
@@ -2883,6 +2885,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             // Resolve operation type: DP=0, AP=1, MEM=2
             enum { SWD_DP, SWD_AP, SWD_MEM } op;
             uint32_t addr;
+            uint8_t ap_index = 0;  // APSEL; only SWD_AP reads it
             int count_arg_idx;  // which parts[] index holds the optional count
 
             uint32_t alias_addr;
@@ -2911,10 +2914,32 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
                 count_arg_idx = -1;
             } else if (strcmp(parts->parts[2], "AP") == 0) {
-                if (parts->count < 4) { api_error("ERROR: Usage: SWD READ AP <addr>\r\n"); goto api_response; }
+                // One argument  -> SWD READ AP <addr>      (APSEL 0, historical form)
+                // Two arguments -> SWD READ AP <n> <addr>  (explicit APSEL)
+                //
+                // Disambiguating by argument COUNT and never by value is what
+                // keeps every existing one-argument call meaning exactly what
+                // it meant before: "SWD READ AP 1" stays AP[0x01], it does not
+                // silently become "AP 1, address missing".
+                //
+                // APSEL != 0 exists for debug ports whose interesting AP is not
+                // the AHB-AP -- e.g. the nRF52's CTRL-AP, the only AP still
+                // answering once APPROTECT is armed, which carries both the
+                // protection status and the mass erase that undoes it.
+                if (parts->count < 4) { api_error("ERROR: Usage: SWD READ AP [<n>] <addr>\r\n"); goto api_response; }
                 op = SWD_AP;
-                if (!parse_u32(parts->parts[3], 16, &addr)) {
-                    api_error("ERROR: Invalid address. Usage: SWD READ AP <addr>\r\n");
+                const char *ap_addr_str = parts->parts[3];
+                if (parts->count >= 5) {
+                    uint32_t n;
+                    if (!parse_u32(parts->parts[3], 0, &n) || n > 0xFF) {
+                        api_error("ERROR: Invalid AP index (0-255). Usage: SWD READ AP [<n>] <addr>\r\n");
+                        goto api_response;
+                    }
+                    ap_index = (uint8_t)n;
+                    ap_addr_str = parts->parts[4];
+                }
+                if (!parse_u32(ap_addr_str, 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD READ AP [<n>] <addr>\r\n");
                     goto api_response;
                 }
                 count_arg_idx = -1;
@@ -2947,10 +2972,17 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
             case SWD_AP: {
                 uint32_t value;
-                if (swd_read_ap(0, addr, &value))
-                    uart_cli_printf("OK: AP[0x%02X] = 0x%08X\r\n", addr, value);
-                else
+                if (swd_read_ap(ap_index, addr, &value)) {
+                    // AP 0 keeps the historical string verbatim: scripts/swd_regression.py
+                    // asserts on "AP[0x00]" / "AP[0xFC]". Only a non-zero APSEL,
+                    // which no existing caller emits, gets the wider form.
+                    if (ap_index == 0)
+                        uart_cli_printf("OK: AP[0x%02X] = 0x%08X\r\n", addr, value);
+                    else
+                        uart_cli_printf("OK: AP%u[0x%02X] = 0x%08X\r\n", ap_index, addr, value);
+                } else {
                     api_error_printf("ERROR: AP read failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
                 break;
             }
             case SWD_MEM: {
@@ -3023,6 +3055,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             // Resolve operation type
             enum { SWD_WR_DP, SWD_WR_AP, SWD_WR_MEM } op;
             uint32_t addr;
+            uint8_t ap_index = 0;  // APSEL; only SWD_WR_AP reads it
             int val_arg_idx;  // which parts[] index holds the value/data
 
             uint32_t alias_addr;
@@ -3048,13 +3081,31 @@ void command_parser_execute(cmd_parts_t *parts) {
                 }
                 val_arg_idx = 4;
             } else if (strcmp(parts->parts[2], "AP") == 0) {
-                if (parts->count < 5) { api_error("ERROR: Usage: SWD WRITE AP <addr> <value>\r\n"); goto api_response; }
+                // Two arguments   -> SWD WRITE AP <addr> <value>      (APSEL 0)
+                // Three arguments -> SWD WRITE AP <n> <addr> <value>  (explicit APSEL)
+                //
+                // Same rule as SWD READ AP, and for the same reason: resolving
+                // by argument count is the only way "SWD WRITE AP 1 0xFC" keeps
+                // meaning AP[0x01] = 0xFC instead of turning into a write to
+                // AP 1's register 0xFC with the value silently dropped.
+                if (parts->count < 5) { api_error("ERROR: Usage: SWD WRITE AP [<n>] <addr> <value>\r\n"); goto api_response; }
                 op = SWD_WR_AP;
-                if (!parse_u32(parts->parts[3], 16, &addr)) {
-                    api_error("ERROR: Invalid address. Usage: SWD WRITE AP <addr> <value>\r\n");
+                const char *ap_addr_str = parts->parts[3];
+                val_arg_idx = 4;
+                if (parts->count >= 6) {
+                    uint32_t n;
+                    if (!parse_u32(parts->parts[3], 0, &n) || n > 0xFF) {
+                        api_error("ERROR: Invalid AP index (0-255). Usage: SWD WRITE AP [<n>] <addr> <value>\r\n");
+                        goto api_response;
+                    }
+                    ap_index = (uint8_t)n;
+                    ap_addr_str = parts->parts[4];
+                    val_arg_idx = 5;
+                }
+                if (!parse_u32(ap_addr_str, 16, &addr)) {
+                    api_error("ERROR: Invalid address. Usage: SWD WRITE AP [<n>] <addr> <value>\r\n");
                     goto api_response;
                 }
-                val_arg_idx = 4;
             } else if (strcmp(parts->parts[2], "MEM") == 0) {
                 if (parts->count < 5) { api_error("ERROR: Usage: SWD WRITE MEM <addr> <value>\r\n"); goto api_response; }
                 op = SWD_WR_MEM;
@@ -3090,14 +3141,22 @@ void command_parser_execute(cmd_parts_t *parts) {
             case SWD_WR_AP: {
                 uint32_t value;
                 if (!parse_u32(parts->parts[val_arg_idx], 16, &value)) {
-                    api_error("ERROR: Invalid value. Usage: SWD WRITE AP <addr> <value>\r\n");
+                    api_error("ERROR: Invalid value. Usage: SWD WRITE AP [<n>] <addr> <value>\r\n");
                     goto api_response;
                 }
-                uart_cli_printf("Writing AP[0x%02X] = 0x%08X\r\n", addr, value);
-                if (swd_write_ap(0, addr, value))
-                    uart_cli_printf("OK: AP[0x%02X] = 0x%08X\r\n", addr, value);
+                // AP 0 keeps the historical string verbatim (see SWD READ AP).
+                if (ap_index == 0)
+                    uart_cli_printf("Writing AP[0x%02X] = 0x%08X\r\n", addr, value);
                 else
+                    uart_cli_printf("Writing AP%u[0x%02X] = 0x%08X\r\n", ap_index, addr, value);
+                if (swd_write_ap(ap_index, addr, value)) {
+                    if (ap_index == 0)
+                        uart_cli_printf("OK: AP[0x%02X] = 0x%08X\r\n", addr, value);
+                    else
+                        uart_cli_printf("OK: AP%u[0x%02X] = 0x%08X\r\n", ap_index, addr, value);
+                } else {
                     api_error_printf("ERROR: AP write failed (ACK=0x%X)\r\n", swd_get_last_ack());
+                }
                 break;
             }
             case SWD_WR_MEM: {
