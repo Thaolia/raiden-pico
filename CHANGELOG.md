@@ -16,6 +16,32 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
 > ce sont des notes prises au banc, elles restent le journal de développement du
 > fork.
 
+## [0.7-JLQ_26/09/24] — glitch de tension sur BAT32G135 (TARGET GLITCH TEST/SWEEP)
+
+### Added
+- **`TARGET GLITCH TEST <voltage> [count]` et `TARGET GLITCH SWEEP` acceptent désormais le
+  BAT32G135** (après `TARGET BAT32`, en mode INTERNAL). Jusqu'ici `TARGET GLITCH` passait par
+  l'auto-détection STM32 (`DBGMCU_IDCODE`) et refusait le BAT32 (`DEV_ID 0x000`, « Unknown DEV_ID »,
+  mesuré au banc le 2026-09-24). Le nouveau chemin appelle la primitive agnostique
+  `power_glitch_once()` (creux du rail : GP10 tiré bas, GP11/12 flottants, jaugé par l'ADC0/GP26) et
+  classe avec l'oracle propre au BAT32 : la **code flash `0x0` devient lisible** ET la **SRAM
+  `0x20000008` survit** = SUCCESS (protection tombée).
+- Les verbes propres aux STM32/LPC (`PAYLOAD`/`BYPASS`/`LPCBYPASS`/`REGDUMP`/…) **errorent
+  explicitement** pour le BAT32 (« unsupported for BAT32 ») au lieu de retomber sur l'auto-détect.
+
+### Changed
+- `TARGET GLITCH` : branche BAT32 en tête du dispatch (après `match_and_replace`), HELP mis à jour.
+
+### Limitation (à ne pas découvrir au banc)
+- ⚠⚠ **Le creux n'est PAS synchronisé sur le reset.** `power_glitch_once()` tire le rail bas pendant
+  que la cible TOURNE ; il ne coïncide pas avec le chargement des octets d'option au relâchement du
+  reset, là où `OCDEN` est verrouillé. Un brownout mid-run qui évite un POR laisse `OCDEN` verrouillé
+  (oracle LOCKED) ; un creux assez profond pour un POR recharge les octets d'option normalement (SRAM
+  perdue). Défaire la protection demande d'aligner le creux sur la fenêtre de reset — **non
+  implémenté**. Ce changement apporte la *capacité de tirer* + l'oracle, pas une défaite prouvée.
+- Source INTERNAL faible (**36 mA**, 3 GPIO gangués) : profondeur réellement atteinte non mesurée.
+- Aucune campagne tirée : ni fenêtre, ni profondeur, ni dwell mesurés sur BAT32.
+
 ## [0.7-JLQ_26/09/18] — index d'AP explicite sur la CLI SWD
 
 ### Added

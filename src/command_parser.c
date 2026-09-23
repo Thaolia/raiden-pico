@@ -531,7 +531,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/18\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/24\r\n");
         // Quel lien porte cette CLI : c'est la seule facon de savoir, depuis
         // l'hote, quelle variante de binaire est reellement sur la puce.
 #if RAIDEN_CONSOLE_UART
@@ -1695,10 +1695,39 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  RESETTEST                  - Reset/low-power disruption test\r\n");
                 uart_cli_send("  TIMING [name|0xADDR] [samples] [FLASH|BOOTLOADER]\r\n");
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
+                uart_cli_send("  (BAT32: only TEST/SWEEP -- power-group dip + flash/SRAM oracle)\r\n");
             } else {
                 const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS",
                                              "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
                 if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
+                    goto api_response;
+                }
+
+                // BAT32 is a read-only target with no stm32_target_info_t: route
+                // TEST/SWEEP to the BAT32 power-group glitch (power_glitch_once +
+                // flash/SRAM oracle). The STM32/LPC-only verbs error clearly.
+                if (target_is_bat32(target_get_type())) {
+                    if (strcmp(parts->parts[2], "TEST") == 0) {
+                        if (parts->count < 4) {
+                            api_error("ERROR: Usage: TARGET GLITCH TEST <voltage> [count]\r\n");
+                            goto api_response;
+                        }
+                        float voltage = strtof(parts->parts[3], NULL);
+                        uint32_t count = 10;
+                        if (parts->count >= 5 && !parse_u32(parts->parts[4], 0, &count)) {
+                            api_error("ERROR: Invalid count. Usage: TARGET GLITCH TEST <voltage> [count]\r\n");
+                            goto api_response;
+                        }
+                        if (count < 1) count = 1;
+                        if (count > 1000) count = 1000;
+                        target_bat32_glitch(voltage, count);
+                    } else if (strcmp(parts->parts[2], "SWEEP") == 0) {
+                        target_bat32_glitch_sweep();
+                    } else {
+                        api_error_printf("ERROR: TARGET GLITCH %s unsupported for BAT32 "
+                                         "(read-only target); use TEST or SWEEP\r\n",
+                                         parts->parts[2]);
+                    }
                     goto api_response;
                 }
 

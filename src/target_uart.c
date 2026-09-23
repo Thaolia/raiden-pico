@@ -1,6 +1,7 @@
 #include "config.h"
 #include "uart_cli.h"
 #include "swd.h"
+#include "bat32_target.h"
 #include "stm32_breakpoints.h"
 #include "glitch.h"
 #include "net_cli.h"
@@ -1637,6 +1638,167 @@ static void power_glitch_once(uint32_t thresh, uint32_t min_width_us,
     }
 
     *adc_log_count_out = adc_log_count;
+}
+
+// --- BAT32G135 power-group voltage glitch (routes power_glitch_once to the BAT32) ---
+//
+// The BAT32 is a read-only target (no stm32_target_info_t), so the STM32 glitch
+// path (target_power_glitch/sweep, gated by ensure_target_type()) refuses it.
+// These functions call the target-agnostic power_glitch_once() primitive directly
+// and classify with the BAT32's OWN oracle: code flash 0x0 becomes READABLE
+// (protection dropped) while SRAM 0x20000008 stays alive.
+//
+// LIMITATION (reasoning, not a defeat): power_glitch_once() dips the rail WHILE
+// THE TARGET RUNS; it is NOT synchronised to the option-byte load at reset, where
+// OCDEN is latched. A mid-run brownout that avoids a POR leaves OCDEN latched
+// (oracle stays LOCKED); one deep enough to POR just re-loads the option bytes
+// normally (SRAM lost). Defeating the protection needs the dip to coincide with
+// the reset option-byte load -- NOT implemented here.
+typedef enum {
+    BG_SUCCESS = 0, BG_LOCKED, BG_SRAM_LOST, BG_TIMEOUT, BG_CONNFAIL
+} bat32_glitch_outcome_t;
+
+static bat32_glitch_outcome_t bat32_glitch_shot(uint32_t thresh, uint32_t dwell_us,
+                                                const bat32_target_info_t *info,
+                                                glitch_result_t *gr_out) {
+    extern bool swd_connect(void);
+    extern void swd_init(void);
+    extern void swd_deinit(void);
+
+    // Float SWD before the dip: a debugger holding SWCLK/SWDIO at 3.3 V reinjects
+    // current through the target I/O diodes and the rail will not drop.
+    swd_deinit();
+    // nRST as input pull-up: never hold the target in reset during the dip.
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_pull_up(reset_pin);
+
+    uint16_t adc_log[64];
+    uint32_t adc_log_count = 0;
+    glitch_result_t gr;
+    power_glitch_once(thresh, dwell_us, adc_log, 64, &adc_log_count, &gr);
+    if (gr_out) *gr_out = gr;
+    if (!gr.thresh_reached)
+        return BG_TIMEOUT;
+
+    sleep_ms(20);  // let the target restart/settle after the dip
+
+    swd_init();
+    if (!swd_connect()) {
+        swd_deinit();
+        return BG_CONNFAIL;
+    }
+    uint32_t fw = 0, sw = 0;
+    bool flash_ok = (swd_read_mem(info->code_flash_base, &fw, 1) == 1);
+    bool sram_ok  = (swd_read_mem(info->sram_base + 8u, &sw, 1) == 1);
+    swd_deinit();
+
+    if (!sram_ok) return BG_SRAM_LOST;
+    if (flash_ok) return BG_SUCCESS;
+    return BG_LOCKED;
+}
+
+void target_bat32_glitch(float voltage, uint32_t count) {
+    if (power_group_glitch_blocked()) return;   // INTERNAL only
+    const bat32_target_info_t *info = bat32_get_target_info(current_target_type);
+    if (!info) {
+        uart_cli_send("ERROR: TARGET BAT32 must be selected first (TARGET BAT32)\r\n");
+        return;
+    }
+    if (!(voltage > 0.0f) || voltage > 3.3f) {
+        uart_cli_send("ERROR: voltage out of range (0 < V <= 3.3)\r\n");
+        return;
+    }
+    uint32_t thresh = (uint32_t)(voltage * 4095.0f / 3.3f);
+    if (thresh > 4095) thresh = 4095;
+
+    uart_cli_printf("BAT32 power glitch: %.2fV threshold (ADC %lu), %lu iterations\r\n",
+                    (double)voltage, (unsigned long)thresh, (unsigned long)count);
+    uart_cli_send("Oracle: flash 0x0 readable + SRAM 0x20000008 alive = SUCCESS (protection dropped)\r\n");
+    uart_cli_send("NOTE: dip is NOT reset-synchronised; see the LIMITATION note in the source/CHANGELOG.\r\n");
+
+    adc_power_init();
+    power_ensure_init();
+    gpio_set_mask(POWER_MASK);   // ensure the INTERNAL rail is up before dipping
+
+    uint32_t n_success = 0, n_locked = 0, n_sramlost = 0, n_timeout = 0, n_connfail = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        glitch_result_t gr;
+        bat32_glitch_outcome_t o = bat32_glitch_shot(thresh, 0, info, &gr);
+        if (o == BG_SUCCESS) {
+            n_success++;
+            uart_cli_printf("[%lu/%lu] SUCCESS: flash readable (vmin ADC %u, glitch %lu us)\r\n",
+                            (unsigned long)(i + 1), (unsigned long)count,
+                            (unsigned)gr.vmin_raw, (unsigned long)gr.glitch_us);
+            break;  // stop on first success -- do NOT power-cycle
+        } else if (o == BG_SRAM_LOST) {
+            n_sramlost++;
+            uart_cli_printf("[%lu/%lu] SRAM lost (vmin ADC %u) -- rail too low / POR?\r\n",
+                            (unsigned long)(i + 1), (unsigned long)count, (unsigned)gr.vmin_raw);
+        } else if (o == BG_TIMEOUT) {
+            n_timeout++;
+        } else if (o == BG_CONNFAIL) {
+            n_connfail++;
+        } else {
+            n_locked++;
+        }
+        sleep_ms(50);
+    }
+
+    gpio_set_mask(POWER_MASK);
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_disable_pulls(reset_pin);
+
+    uart_cli_printf("BAT32 glitch done: success=%lu locked=%lu sram_lost=%lu timeout=%lu connfail=%lu\r\n",
+                    (unsigned long)n_success, (unsigned long)n_locked, (unsigned long)n_sramlost,
+                    (unsigned long)n_timeout, (unsigned long)n_connfail);
+    if (n_success)
+        uart_cli_send("SUCCESS: do NOT power-cycle -- the Level 0 obtained is lost at the next reset "
+                      "until OCDEN is rewritten. Dump now.\r\n");
+}
+
+void target_bat32_glitch_sweep(void) {
+    if (power_group_glitch_blocked()) return;
+    const bat32_target_info_t *info = bat32_get_target_info(current_target_type);
+    if (!info) {
+        uart_cli_send("ERROR: TARGET BAT32 must be selected first (TARGET BAT32)\r\n");
+        return;
+    }
+
+    uart_cli_send("BAT32 glitch sweep: 2.80V -> 0.80V, 3 shots each\r\n");
+    uart_cli_send("Oracle: flash 0x0 readable + SRAM alive = SUCCESS\r\n");
+    uart_cli_send("NOTE: dip is NOT reset-synchronised; see the LIMITATION note in the source/CHANGELOG.\r\n");
+
+    adc_power_init();
+    power_ensure_init();
+    gpio_set_mask(POWER_MASK);
+
+    bool any_success = false;
+    for (float v = 2.8f; v >= 0.8f && !any_success; v -= 0.2f) {
+        uint32_t thresh = (uint32_t)(v * 4095.0f / 3.3f);
+        uint32_t succ = 0, sramlost = 0, locked = 0, timeout = 0;
+        for (int s = 0; s < 3; s++) {
+            glitch_result_t gr;
+            bat32_glitch_outcome_t o = bat32_glitch_shot(thresh, 0, info, &gr);
+            if (o == BG_SUCCESS)        { succ++; any_success = true; break; }
+            else if (o == BG_SRAM_LOST) sramlost++;
+            else if (o == BG_TIMEOUT)   timeout++;
+            else if (o == BG_LOCKED)    locked++;
+            sleep_ms(50);
+        }
+        uart_cli_printf("  %.2fV (ADC %lu): success=%lu locked=%lu sram_lost=%lu timeout=%lu\r\n",
+                        (double)v, (unsigned long)thresh, (unsigned long)succ,
+                        (unsigned long)locked, (unsigned long)sramlost, (unsigned long)timeout);
+    }
+
+    gpio_set_mask(POWER_MASK);
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_disable_pulls(reset_pin);
+    uart_cli_send(any_success
+        ? "Sweep: SUCCESS found -- do NOT power-cycle, dump now.\r\n"
+        : "Sweep complete, no success. Widen depth/dwell, check ADC/wiring, or reset-sync is needed.\r\n");
 }
 
 static float adc_read_voltage(void) {

@@ -367,6 +367,13 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
   before switching. The CPU-side power-group glitch routines (`SWEEP`/`GLITCH`/`PAYLOAD`/
   `BYPASS`/LPC bypass) are refused in `EXT` mode — use the PIO crowbar (`ARM` + trigger).
 
+- **BAT32G135**: after `TARGET BAT32` (INTERNAL mode), `TARGET GLITCH TEST <voltage> [count]` and
+  `SWEEP` route the target-agnostic power-group dip (`power_glitch_once`) with a BAT32 oracle — code
+  flash `0x0` becomes readable **and** SRAM `0x20000008` stays alive = SUCCESS (protection dropped).
+  The STM32/LPC-only verbs (`PAYLOAD`/`BYPASS`/`LPCBYPASS`/`REGDUMP`/…) error for BAT32. ⚠ The dip is
+  NOT reset-synchronised, so it does not by itself defeat the OCDEN option-byte protection latched at
+  reset (see CHANGELOG) — it provides the fire capability + oracle, not a proven defeat.
+
 **`TARGET GLITCH SWEEP`** - Calibrate voltage glitch threshold
 - Ramps target power down via ADC monitoring to find brown-out reset voltage
 - Required before PAYLOAD or BYPASS commands

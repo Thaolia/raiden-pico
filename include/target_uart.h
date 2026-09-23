@@ -79,6 +79,8 @@ bool target_crowbar_gate_active_high(void);
 void target_crowbar_gate_idle(void);  // drive GP11 to safe de-asserted idle (GPIO)
 void target_power_sweep(void);
 void target_power_glitch(float voltage, uint32_t count);
+void target_bat32_glitch(float voltage, uint32_t count);
+void target_bat32_glitch_sweep(void);
 // LPC CRP-bypass via ADC-controlled VDD glitch. Reads glitch config VMIN
 // (depth, mV) and WIDTH (min-dwell, cycles → us). Each attempt: drop power
 // to VMIN, dwell, restore, re-sync ISP, send R 0 4, classify response.
