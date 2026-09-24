@@ -1653,18 +1653,50 @@ static void power_glitch_once(uint32_t thresh, uint32_t min_width_us,
 // OCDEN is latched. A mid-run brownout that avoids a POR leaves OCDEN latched
 // (oracle stays LOCKED); one deep enough to POR just re-loads the option bytes
 // normally (SRAM lost). Defeating the protection needs the dip to coincide with
-// the reset option-byte load -- NOT implemented here.
+// the reset option-byte load -- NOT done here, but see bat32_glitch_sync_shot()
+// below (SWD GLITCH / SWD GLITCH SWEEP), which times the dip to a controlled nRST
+// release for exactly that window.
 typedef enum {
     BG_SUCCESS = 0, BG_LOCKED, BG_SRAM_LOST, BG_TIMEOUT, BG_CONNFAIL
 } bat32_glitch_outcome_t;
 
+// Post-dip oracle: settle, (re)connect SWD, and read the BAT32's own two witnesses
+// -- code flash 0x0 must be READABLE (protection dropped) while SRAM 0x20000008
+// stays alive -- then classify. leave_connected_on_success=false always
+// disconnects (the TARGET GLITCH TEST/SWEEP behaviour); =true leaves the target
+// powered + connected on SUCCESS so the caller can dump before the next reset
+// takes the Level 0 back. swd_init/connect/deinit/read_mem are declared in swd.h.
+static bat32_glitch_outcome_t bat32_glitch_oracle_after_dip(
+        const bat32_target_info_t *info, bool leave_connected_on_success) {
+    sleep_ms(20);  // let the target restart/settle after the dip
+
+    swd_init();
+    if (!swd_connect()) {
+        swd_deinit();
+        return BG_CONNFAIL;
+    }
+    uint32_t fw = 0, sw = 0;
+    bool flash_ok = (swd_read_mem(info->code_flash_base, &fw, 1) == 1);
+    // A protected-level flash read FAULTs and leaves DP STICKYERR set; without
+    // clearing it, the SRAM read below fails too and a locked target is
+    // misclassified as sram_lost (measured at the bench 2026-09-24: SWD READ
+    // 0x20000008 returns data standalone while the oracle reported sram_lost).
+    // swd_connect() already cleared sticky at connect time -- this clears the
+    // error the flash read itself just raised.
+    swd_clear_errors();
+    bool sram_ok  = (swd_read_mem(info->sram_base + 8u, &sw, 1) == 1);
+    bool success  = sram_ok && flash_ok;
+    if (!(leave_connected_on_success && success))
+        swd_deinit();
+
+    if (!sram_ok) return BG_SRAM_LOST;
+    if (flash_ok) return BG_SUCCESS;
+    return BG_LOCKED;
+}
+
 static bat32_glitch_outcome_t bat32_glitch_shot(uint32_t thresh, uint32_t dwell_us,
                                                 const bat32_target_info_t *info,
                                                 glitch_result_t *gr_out) {
-    extern bool swd_connect(void);
-    extern void swd_init(void);
-    extern void swd_deinit(void);
-
     // Float SWD before the dip: a debugger holding SWCLK/SWDIO at 3.3 V reinjects
     // current through the target I/O diodes and the rail will not drop.
     swd_deinit();
@@ -1681,21 +1713,7 @@ static bat32_glitch_outcome_t bat32_glitch_shot(uint32_t thresh, uint32_t dwell_
     if (!gr.thresh_reached)
         return BG_TIMEOUT;
 
-    sleep_ms(20);  // let the target restart/settle after the dip
-
-    swd_init();
-    if (!swd_connect()) {
-        swd_deinit();
-        return BG_CONNFAIL;
-    }
-    uint32_t fw = 0, sw = 0;
-    bool flash_ok = (swd_read_mem(info->code_flash_base, &fw, 1) == 1);
-    bool sram_ok  = (swd_read_mem(info->sram_base + 8u, &sw, 1) == 1);
-    swd_deinit();
-
-    if (!sram_ok) return BG_SRAM_LOST;
-    if (flash_ok) return BG_SUCCESS;
-    return BG_LOCKED;
+    return bat32_glitch_oracle_after_dip(info, false);
 }
 
 void target_bat32_glitch(float voltage, uint32_t count) {
@@ -1799,6 +1817,408 @@ void target_bat32_glitch_sweep(void) {
     uart_cli_send(any_success
         ? "Sweep: SUCCESS found -- do NOT power-cycle, dump now.\r\n"
         : "Sweep complete, no success. Widen depth/dwell, check ADC/wiring, or reset-sync is needed.\r\n");
+}
+
+// --- Reset-synchronised BAT32G135 voltage glitch (SWD GLITCH / SWD GLITCH SWEEP) ---
+//
+// The gap target_bat32_glitch()/_sweep() flag in their LIMITATION note: those dip
+// the rail WHILE THE TARGET RUNS, never coinciding with the option-byte load at
+// reset where OCDEN is latched. bat32_glitch_sync_shot() times the dip to a
+// controlled nRST release instead -- hold the core in reset, release it, wait
+// delay_us, then dip -- so the dip can land in the OCDEN load window.
+//
+// Sync is straight-line C, NOT the PIO nRST sequencer (swd_phy_nrst_race): the dip
+// is a CPU gpio_clr_mask, not a PIO event, so there is no PIO-to-PIO relationship to
+// exploit -- routing nRST through PIO would only move delay-counting off-CPU while
+// the fire stayed on it, adding a return path without removing release->fire jitter.
+// Residual jitter is a handful of 150 MHz instructions plus power_glitch_once's own
+// preamble (arm IRQ / float pins / select ADC), which runs INSIDE the timed window
+// after the busy-wait -- a fixed offset of order microseconds. This is best-effort
+// sync at the microsecond scale, not cycle-exact.
+static bat32_glitch_outcome_t bat32_glitch_sync_shot(uint32_t thresh, uint32_t dwell_us,
+                                                     uint32_t delay_us, bool power_cycle,
+                                                     bool use_nrst, uint32_t settle_ms,
+                                                     const bat32_target_info_t *info,
+                                                     glitch_result_t *gr_out) {
+    // Float SWD before touching power/reset (see bat32_glitch_shot).
+    swd_deinit();
+
+    // Hold the core in reset across the (optional) power cycle so the option-byte
+    // load happens on the nRST release we time below, not on a stray power-on boot.
+    // NORST (use_nrst=false) skips both the assert here and the release below: nRST
+    // is left untouched and the dip is timed from the window opening, not a reset edge.
+    if (use_nrst)
+        swd_nrst_assert();
+    if (power_cycle) {
+        power_drive(POWER_MASK, false);
+        sleep_ms(power_cycle_time_ms);
+        power_drive(POWER_MASK, true);
+        if (settle_ms)          // SETTLE 0 removes the rail-settle (e.g. NORST power-on-sync)
+            sleep_ms(settle_ms);
+    }
+
+    uint16_t adc_log[64];
+    uint32_t adc_log_count = 0;
+    glitch_result_t gr;
+    {
+        NET_QUIET_SECTION;
+        if (use_nrst)
+            swd_nrst_release();      // t0: target boots; OCDEN loads within us of this edge
+        busy_wait_us_32(delay_us);   // exact, no clamp (as swd_race_once)
+        power_glitch_once(thresh, dwell_us, adc_log, 64, &adc_log_count, &gr);
+    }
+    if (gr_out) *gr_out = gr;
+    if (!gr.thresh_reached)
+        return BG_TIMEOUT;
+
+    return bat32_glitch_oracle_after_dip(info, true);
+}
+
+void target_bat32_glitch_sync(uint32_t delay_us, float voltage,
+                              uint32_t dwell_us, bool power_cycle, bool use_nrst,
+                              uint32_t settle_ms) {
+    if (power_group_glitch_blocked()) return;   // INTERNAL only
+    const bat32_target_info_t *info = bat32_get_target_info(current_target_type);
+    if (!info) {
+        uart_cli_send("ERROR: TARGET BAT32 must be selected first (TARGET BAT32)\r\n");
+        return;
+    }
+    if (!(voltage > 0.0f) || voltage > 3.3f) {
+        uart_cli_send("ERROR: voltage out of range (0 < V <= 3.3)\r\n");
+        return;
+    }
+    uint32_t thresh = (uint32_t)(voltage * 4095.0f / 3.3f);
+    if (thresh > 4095) thresh = 4095;
+
+    uart_cli_printf("BAT32 glitch: delay=%luus, %.2fV (ADC %lu), dwell=%luus, %s, %s, settle=%lums\r\n",
+                    (unsigned long)delay_us, (double)voltage, (unsigned long)thresh,
+                    (unsigned long)dwell_us,
+                    power_cycle ? "power-cycle" : "NOPWR",
+                    use_nrst ? "nRST-synced" : "NORST (no reset-sync)",
+                    (unsigned long)(power_cycle ? settle_ms : 0u));
+    uart_cli_send("Oracle: flash 0x0 readable + SRAM 0x20000008 alive = SUCCESS (protection dropped)\r\n");
+
+    adc_power_init();
+    power_ensure_init();
+    gpio_set_mask(POWER_MASK);   // rail up before the shot
+
+    glitch_result_t gr;
+    bat32_glitch_outcome_t o = bat32_glitch_sync_shot(thresh, dwell_us, delay_us,
+                                                      power_cycle, use_nrst, settle_ms, info, &gr);
+    const char *o_str = o == BG_SUCCESS ? "SUCCESS" :
+                        o == BG_LOCKED  ? "locked"  :
+                        o == BG_SRAM_LOST ? "sram_lost" :
+                        o == BG_TIMEOUT ? "timeout" : "connfail";
+    uart_cli_printf("GLITCH delay=%luus thr=%lu -> %s (vmin ADC %u, glitch %lu us, nRST_low=%s)\r\n",
+                    (unsigned long)delay_us, (unsigned long)thresh, o_str,
+                    (unsigned)gr.vmin_raw, (unsigned long)gr.glitch_us,
+                    gr.nrst_went_low ? "Y" : "N");
+
+    if (o == BG_SUCCESS) {
+        uart_cli_send("OK: SWD GLITCH SUCCESS -- target left powered + connected, dump now "
+                      "(do NOT reset or power-cycle -- Level 0 is lost at the next reset)\r\n");
+    } else {
+        // Non-success: restore a clean idle (rail up, nRST released).
+        gpio_set_mask(POWER_MASK);
+        gpio_init(reset_pin);
+        gpio_set_dir(reset_pin, GPIO_IN);
+        gpio_disable_pulls(reset_pin);
+    }
+}
+
+bool target_bat32_glitch_sync_sweep(uint32_t d_start_us, uint32_t d_end_us, uint32_t d_step_us,
+                                    uint32_t thr_start, uint32_t thr_end, uint32_t thr_step,
+                                    uint32_t shots, uint32_t dwell_us, bool power_cycle,
+                                    bool use_nrst, uint32_t settle_ms) {
+    if (power_group_glitch_blocked()) return false;   // INTERNAL only
+    const bat32_target_info_t *info = bat32_get_target_info(current_target_type);
+    if (!info) {
+        uart_cli_send("ERROR: TARGET BAT32 must be selected first (TARGET BAT32)\r\n");
+        return false;
+    }
+
+    adc_power_init();
+    power_ensure_init();
+    gpio_set_mask(POWER_MASK);   // energise once; power-cycle shots re-do it, NOPWR shots reuse it
+
+    uint32_t n_delay = (d_end_us - d_start_us) / d_step_us + 1;
+    uint32_t n_thr   = (thr_end - thr_start) / thr_step + 1;
+    uint32_t total   = n_delay * n_thr * shots;
+    uint32_t done = 0;
+    uint32_t n_success = 0, n_locked = 0, n_sramlost = 0, n_timeout = 0, n_connfail = 0;
+    uint32_t last_print_ms = to_ms_since_boot(get_absolute_time());
+    bool found = false, aborted = false;
+    glitch_result_t success_gr = {0};
+    uint32_t success_delay = 0, success_thr = 0;
+
+    for (uint32_t di = 0; di < n_delay && !found && !aborted; di++) {
+        uint32_t delay_us = d_start_us + di * d_step_us;
+        for (uint32_t ti = 0; ti < n_thr && !found && !aborted; ti++) {
+            uint32_t thr = thr_start + ti * thr_step;
+            for (uint32_t s = 0; s < shots; s++) {
+                net_cli_pump();  // keep the TCP link alive, outside the timed window
+                if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) {
+                    printf("\r\n[SWD GLITCH] aborted by user at delay=%luus thr=%lu (%lu/%lu)\r\n",
+                           (unsigned long)delay_us, (unsigned long)thr,
+                           (unsigned long)done, (unsigned long)total);
+                    aborted = true;
+                    break;
+                }
+
+                glitch_result_t gr;
+                bat32_glitch_outcome_t o = bat32_glitch_sync_shot(thr, dwell_us, delay_us,
+                                                                  power_cycle, use_nrst, settle_ms,
+                                                                  info, &gr);
+                done++;
+                if (o == BG_SUCCESS) {
+                    n_success++;
+                    success_gr = gr; success_delay = delay_us; success_thr = thr;
+                    printf("\r\n*** SWD GLITCH SUCCESS at delay=%luus thr=%lu (%.2fV, shot %lu/%lu) "
+                           "vmin ADC %u ***\r\n",
+                           (unsigned long)delay_us, (unsigned long)thr,
+                           (double)(thr * 3.3f / 4095.0f),
+                           (unsigned long)(s + 1), (unsigned long)shots, (unsigned)gr.vmin_raw);
+                    printf("*** TARGET LEFT POWERED + CONNECTED -- dump now, do not reset/power-cycle ***\r\n");
+                    found = true;
+                    break;
+                }
+                switch (o) {
+                    case BG_SRAM_LOST: n_sramlost++; break;
+                    case BG_TIMEOUT:   n_timeout++;  break;
+                    case BG_CONNFAIL:  n_connfail++; break;
+                    case BG_LOCKED:
+                    default:           n_locked++;   break;
+                }
+            }
+
+            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            if (!found && !aborted &&
+                (now_ms - last_print_ms >= 500 || (di == n_delay - 1 && ti == n_thr - 1))) {
+                printf("\r[SWD GLITCH] delay=%luus thr=%lu (%.2fV) (%lu/%lu) "
+                       "success=%lu locked=%lu sram_lost=%lu timeout=%lu connfail=%lu",
+                       (unsigned long)delay_us, (unsigned long)thr,
+                       (double)(thr * 3.3f / 4095.0f),
+                       (unsigned long)done, (unsigned long)total,
+                       (unsigned long)n_success, (unsigned long)n_locked,
+                       (unsigned long)n_sramlost, (unsigned long)n_timeout,
+                       (unsigned long)n_connfail);
+                last_print_ms = now_ms;
+            }
+        }
+    }
+
+    if (found) {
+        // Target left powered + connected -- do NOT restore idle / power-cycle.
+        printf("\r\n[SWD GLITCH] SUCCESS at delay=%luus thr=%lu -- oracle=flash+SRAM, "
+               "vmin ADC %u, glitch %lu us\r\n",
+               (unsigned long)success_delay, (unsigned long)success_thr,
+               (unsigned)success_gr.vmin_raw, (unsigned long)success_gr.glitch_us);
+        return true;
+    }
+
+    // No success (exhausted or aborted): restore a clean idle (rail up, nRST released).
+    gpio_set_mask(POWER_MASK);
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_disable_pulls(reset_pin);
+    if (!aborted)
+        printf("\r\n[SWD GLITCH] sweep complete, no success. "
+               "success=%lu locked=%lu sram_lost=%lu timeout=%lu connfail=%lu\r\n",
+               (unsigned long)n_success, (unsigned long)n_locked,
+               (unsigned long)n_sramlost, (unsigned long)n_timeout, (unsigned long)n_connfail);
+    return false;
+}
+
+// --- Reset-synchronised PIO-pulse glitch (SWD GLITCH PIO) : crowbar + EMFI trigger ---
+//
+// Where the INTERNAL sag is a slow (~140us) rail dip the LVD/POR catch, this fires the
+// PIO pulse engine on the nRST-release edge: a sub-us pulse `pause_cy` cycles after the
+// target releases reset, `width_cy` cycles wide, on GP2 (EMFI trigger) + GP11 (crowbar
+// in EXTERNAL mode). Both BAT32 detectors need a >=300us excursion (datasheet 6.8.5/6.8.6),
+// so a sub-us pulse slips under them and can corrupt the OCDEN flash read without a clean
+// reset -- the only path to a faulted OCDEN (!= 0xC3 -> L0). raiden holds TIME + ORACLE;
+// the injector (FaultyCat) holds POWER and must be armed separately (see docs/08).
+static bat32_glitch_outcome_t bat32_glitch_pio_shot(uint32_t pause_cy, uint32_t width_cy,
+                                                    bool power_cycle, uint32_t settle_ms,
+                                                    const bat32_target_info_t *info,
+                                                    bool *trigger_seen) {
+    // Configure the PIO glitch engine for one reset-synced pulse triggered by GP3<-GP15.
+    glitch_set_pause(pause_cy);
+    glitch_set_width(width_cy);
+    glitch_set_gap(0);
+    glitch_set_count(1);
+    glitch_set_trigger_type(TRIGGER_GPIO);
+    glitch_set_trigger_pin(3, EDGE_RISING);   // GP3 (fixed trigger in), strapped to nRST GP15
+
+    swd_deinit();          // float SWCLK/SWDIO before the shot
+    swd_nrst_assert();     // hold the target in reset while we arm
+    if (power_cycle) {
+        power_drive(POWER_MASK, false);
+        sleep_ms(power_cycle_time_ms);
+        power_drive(POWER_MASK, true);
+        if (settle_ms)
+            sleep_ms(settle_ms);
+    }
+
+    if (!glitch_arm()) {   // arm the PIO to wait for the GP3 rising edge
+        *trigger_seen = false;
+        return BG_CONNFAIL;
+    }
+
+    {
+        NET_QUIET_SECTION;
+        swd_nrst_release();   // GP15 -> Hi-Z: target releases reset; GP3 sees the rising edge
+        // The PIO fires the pulse pause_cy cycles later on GP2 (+GP11 if EXTERNAL).
+    }
+
+    // Bounded wait for the pulse to fire: glitch_get_count() auto-disarms on FIFO-empty
+    // (params are pulled at the START of the train, so this returns within us of the edge).
+    bool fired = false;
+    for (uint32_t i = 0; i < 200; i++) {   // up to ~200 ms
+        glitch_get_count();
+        if (!glitch_get_flags()->armed) { fired = true; break; }
+        sleep_ms(1);
+    }
+    *trigger_seen = fired;
+    glitch_disarm();       // clean state for the next shot
+
+    return bat32_glitch_oracle_after_dip(info, true);
+}
+
+void target_bat32_glitch_pio(uint32_t pause_cy, uint32_t width_cy,
+                             bool power_cycle, uint32_t settle_ms) {
+    const bat32_target_info_t *info = bat32_get_target_info(current_target_type);
+    if (!info) {
+        uart_cli_send("ERROR: TARGET BAT32 must be selected first (TARGET BAT32)\r\n");
+        return;
+    }
+    uart_cli_printf("BAT32 PIO glitch: pause=%lu cy (%.2fus), width=%lu cy (%.2fus), %s\r\n",
+                    (unsigned long)pause_cy, (double)(pause_cy / 150.0f),
+                    (unsigned long)width_cy, (double)(width_cy / 150.0f),
+                    power_cycle ? "power-cycle" : "NOPWR");
+    uart_cli_send("Pulse on GP2 (EMFI trigger) + GP11 (crowbar if TARGET POWER EXT); "
+                  "needs GP15->GP3 strap. Oracle: flash 0x0 + SRAM 0x20000008.\r\n");
+
+    target_power_ensure_on();   // energise (respects the current power mode)
+
+    bool trig = false;
+    bat32_glitch_outcome_t o = bat32_glitch_pio_shot(pause_cy, width_cy, power_cycle,
+                                                     settle_ms, info, &trig);
+    if (!trig)
+        uart_cli_send("WARNING: no trigger seen on GP3 -- check the GP15->GP3 strap "
+                      "(TRIGGER GPIO RISING). The pulse likely did NOT fire.\r\n");
+    const char *o_str = o == BG_SUCCESS ? "SUCCESS" :
+                        o == BG_LOCKED  ? "locked"  :
+                        o == BG_SRAM_LOST ? "sram_lost" :
+                        o == BG_TIMEOUT ? "timeout" : "connfail";
+    uart_cli_printf("PIO GLITCH pause=%lu width=%lu -> %s (trigger=%s)\r\n",
+                    (unsigned long)pause_cy, (unsigned long)width_cy, o_str,
+                    trig ? "Y" : "N");
+    if (o == BG_SUCCESS) {
+        uart_cli_send("OK: SWD GLITCH PIO SUCCESS -- target left powered + connected, dump now "
+                      "(do NOT reset or power-cycle -- Level 0 is lost at the next reset)\r\n");
+    } else {
+        gpio_init(reset_pin);
+        gpio_set_dir(reset_pin, GPIO_IN);
+        gpio_disable_pulls(reset_pin);
+    }
+}
+
+bool target_bat32_glitch_pio_sweep(uint32_t p_start, uint32_t p_end, uint32_t p_step,
+                                   uint32_t w_start, uint32_t w_end, uint32_t w_step,
+                                   uint32_t shots, bool power_cycle, uint32_t settle_ms) {
+    const bat32_target_info_t *info = bat32_get_target_info(current_target_type);
+    if (!info) {
+        uart_cli_send("ERROR: TARGET BAT32 must be selected first (TARGET BAT32)\r\n");
+        return false;
+    }
+
+    target_power_ensure_on();
+
+    uint32_t n_pause = (p_end - p_start) / p_step + 1;
+    uint32_t n_width = (w_end - w_start) / w_step + 1;
+    uint32_t total = n_pause * n_width * shots;
+    uint32_t done = 0;
+    uint32_t n_success = 0, n_locked = 0, n_sramlost = 0, n_timeout = 0, n_connfail = 0;
+    uint32_t last_print_ms = to_ms_since_boot(get_absolute_time());
+    bool found = false, aborted = false;
+    uint32_t success_pause = 0, success_width = 0;
+
+    for (uint32_t pi = 0; pi < n_pause && !found && !aborted; pi++) {
+        uint32_t pause_cy = p_start + pi * p_step;
+        for (uint32_t wi = 0; wi < n_width && !found && !aborted; wi++) {
+            uint32_t width_cy = w_start + wi * w_step;
+            for (uint32_t s = 0; s < shots; s++) {
+                net_cli_pump();
+                if (getchar_timeout_us(0) != PICO_ERROR_TIMEOUT) {
+                    printf("\r\n[SWD GLITCH PIO] aborted by user at pause=%lu width=%lu (%lu/%lu)\r\n",
+                           (unsigned long)pause_cy, (unsigned long)width_cy,
+                           (unsigned long)done, (unsigned long)total);
+                    aborted = true;
+                    break;
+                }
+
+                bool trig = false;
+                bat32_glitch_outcome_t o = bat32_glitch_pio_shot(pause_cy, width_cy, power_cycle,
+                                                                 settle_ms, info, &trig);
+                done++;
+                if (done == 1 && !trig) {
+                    // Fail loud on the first shot: without the GP3 edge nothing fires.
+                    printf("\r\n");
+                    uart_cli_send("ERROR: no trigger seen on GP3 on the first shot -- check the "
+                                  "GP15->GP3 strap. Aborting (nothing would fire).\r\n");
+                    aborted = true;
+                    break;
+                }
+                if (o == BG_SUCCESS) {
+                    n_success++;
+                    success_pause = pause_cy; success_width = width_cy;
+                    printf("\r\n*** SWD GLITCH PIO SUCCESS at pause=%lu width=%lu (shot %lu/%lu) ***\r\n",
+                           (unsigned long)pause_cy, (unsigned long)width_cy,
+                           (unsigned long)(s + 1), (unsigned long)shots);
+                    printf("*** TARGET LEFT POWERED + CONNECTED -- dump now, do not reset/power-cycle ***\r\n");
+                    found = true;
+                    break;
+                }
+                switch (o) {
+                    case BG_SRAM_LOST: n_sramlost++; break;
+                    case BG_TIMEOUT:   n_timeout++;  break;
+                    case BG_CONNFAIL:  n_connfail++; break;
+                    case BG_LOCKED:
+                    default:           n_locked++;   break;
+                }
+            }
+
+            uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+            if (!found && !aborted &&
+                (now_ms - last_print_ms >= 500 || (pi == n_pause - 1 && wi == n_width - 1))) {
+                printf("\r[SWD GLITCH PIO] pause=%lu width=%lu (%lu/%lu) "
+                       "success=%lu locked=%lu sram_lost=%lu timeout=%lu connfail=%lu",
+                       (unsigned long)pause_cy, (unsigned long)width_cy,
+                       (unsigned long)done, (unsigned long)total,
+                       (unsigned long)n_success, (unsigned long)n_locked,
+                       (unsigned long)n_sramlost, (unsigned long)n_timeout,
+                       (unsigned long)n_connfail);
+                last_print_ms = now_ms;
+            }
+        }
+    }
+
+    if (found) {
+        printf("\r\n[SWD GLITCH PIO] SUCCESS at pause=%lu width=%lu\r\n",
+               (unsigned long)success_pause, (unsigned long)success_width);
+        return true;
+    }
+
+    gpio_init(reset_pin);
+    gpio_set_dir(reset_pin, GPIO_IN);
+    gpio_disable_pulls(reset_pin);
+    if (!aborted)
+        printf("\r\n[SWD GLITCH PIO] sweep complete, no success. "
+               "success=%lu locked=%lu sram_lost=%lu timeout=%lu connfail=%lu\r\n",
+               (unsigned long)n_success, (unsigned long)n_locked,
+               (unsigned long)n_sramlost, (unsigned long)n_timeout, (unsigned long)n_connfail);
+    return false;
 }
 
 static float adc_read_voltage(void) {

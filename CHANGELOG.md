@@ -16,6 +16,121 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
 > ce sont des notes prises au banc, elles restent le journal de développement du
 > fork.
 
+## [0.7-JLQ_26/09/24-v6] — SWD GLITCH PIO : impulsion PIO reset-synchronisée (EMFI + crowbar)
+
+### Added
+- **`SWD GLITCH PIO <pause_cy> <width_cy> [NOPWR] [SETTLE <ms>]`** et
+  **`SWD GLITCH PIO SWEEP <p0> <p1> <pstep> <w0> <w1> <wstep> [SHOTS <n>] [NOPWR] [SETTLE <ms>]`** :
+  glitch **reset-synchronisé par le moteur PIO** (impulsion **sub-µs**, franche), au lieu de
+  l'affaissement lent INTERNAL. Le PIO s'arme sur le **front de relâchement de nRST** (`GP15 → GP3`,
+  `TRIGGER GPIO RISING`) et tire l'impulsion `pause` **cycles** (6,67 ns) après, `width` cycles de
+  large, sur **GP2** (trigger EMFI, ex. FaultyCat) **et GP11** (crowbar si `TARGET POWER EXT`). Puis
+  l'oracle flash/SRAM. Sweep 2D `pause × width`, arrêt au 1er SUCCESS.
+- ★ **Pourquoi c'est la bonne voie sur BAT32** : le LVD et le POR exigent tous deux une excursion
+  **≥ 300 µs** (datasheet §6.8.5/§6.8.6) — une impulsion sub-µs **passe dessous** et peut corrompre la
+  relecture flash d'`OCDEN` sans reset propre, contrairement au sag lent (~140 µs) qui ne fait que
+  déclencher un brownout. Un EMFI (qui n'attaque pas VDD) échappe de toute façon au LVD/POR.
+
+### Notes / limites
+- ⚠ **Nécessite le strap `GP15 → GP3`** (câblage du banc `docs/08`) ; sans lui, aucun front ne
+  déclenche le PIO — le 1er tir échoue « no trigger seen on GP3 » et le sweep s'arrête net.
+- ⚠ **raiden tient le TEMPS + l'ORACLE, l'injecteur tient la PUISSANCE** : pour l'EMFI, le **FaultyCat
+  doit être armé (fire) séparément** — raiden ne génère que le trigger reset-synchronisé. Le crowbar
+  GP11 (variante B, `TARGET POWER EXT`) est 100 % raiden.
+- `pause`/`width` sont en **cycles PIO** (6,67 ns), comme `SET PAUSE`/`SET WIDTH`. L'oracle réutilise
+  `bat32_glitch_oracle_after_dip` (fix STICKYERR inclus).
+
+### Changed
+- Version : `v0.7-JLQ_26/09/24-v5` → `v0.7-JLQ_26/09/24-v6`.
+
+## [0.7-JLQ_26/09/24-v5] — SWD GLITCH : option `SETTLE <ms>` (settle rail réglable)
+
+### Added
+- **Option `SETTLE <ms>`** sur `SWD GLITCH` et `SWD GLITCH SWEEP` : règle le settle du rail après le
+  power-on, **dans le power-cycle du chemin glitch uniquement** (défaut `100`, **`0` = aucun**). Ne touche
+  **pas** le `POWER_ON_SETTLE_MS` global (auto-power-on avant `SWD CONNECT`/`TARGET SYNC`), qui reste à 100 ms.
+  - En `NORST` + power-cycle, `SETTLE 0` place le creux **juste après le power-on** (au lieu de settle+delay)
+    → utile pour un tir calé sur la sortie de POR.
+  - En nRST-synced, `SETTLE` réduit le temps mort par tir avant le relâchement de nRST (⚠ trop bas = risque
+    de relâcher sur un rail pas stabilisé).
+- L'en-tête imprimé indique `settle=<ms>ms` (0 quand `NOPWR`, le settle ne s'appliquant qu'au power-cycle).
+
+### Changed
+- Version : `v0.7-JLQ_26/09/24-v4` → `v0.7-JLQ_26/09/24-v5`.
+- Signatures : `target_bat32_glitch_sync[_sweep]()` prennent un `uint32_t settle_ms` supplémentaire ;
+  nouvelle constante `SWD_GLITCH_DEFAULT_SETTLE_MS` (100).
+
+## [0.7-JLQ_26/09/24-v4] — SWD GLITCH : option `NORST` (glitch sans reset)
+
+### Added
+- **Mot-clé `NORST`** sur `SWD GLITCH` et `SWD GLITCH SWEEP`, symétrique de `NOPWR` : ne touche **pas**
+  nRST (ni assert ni release). Le creux est alors calé sur l'**ouverture de la fenêtre**, pas sur un
+  front de reset (donc **pas de reset-sync**). Quatre combinaisons désormais possibles :
+  - défaut (nRST + power-cycle) : creux **synchronisé au relâchement de nRST** — la voie OCDEN ;
+  - `NOPWR` : idem, sans power-cycle (rail alimenté une fois) ;
+  - `NORST` : creux sur cible non resetée après `delay`, rail power-cyclé (creux **tardif**, ~settle+delay) ;
+  - `NOPWR NORST` : creux **libre** sur la cible qui tourne, `delay` après l'ouverture de la fenêtre.
+- L'en-tête imprimé indique les deux drapeaux (`power-cycle`/`NOPWR`, `nRST-synced`/`NORST`).
+
+### Changed
+- Version : `v0.7-JLQ_26/09/24-v3` → `v0.7-JLQ_26/09/24-v4`.
+- Signatures : `target_bat32_glitch_sync[_sweep]()` prennent un `bool use_nrst` supplémentaire.
+
+### Note
+- ⚠ `NORST` **désactive la synchronisation reset** : pour l'attaque de la fenêtre OCDEN (le cas utile),
+  garder nRST **actif** (défaut). `NORST` sert aux tirs libres / de comparaison, ou pour glitcher un
+  état d'exécution ; combiné au power-cycle, le creux tombe bien après la fenêtre de reset (settle 100 ms).
+
+## [0.7-JLQ_26/09/24-v3] — oracle BAT32 : ne plus confondre « verrouillé » et « SRAM perdue »
+
+### Fixed
+- **`BG_LOCKED` était inatteignable sur cible protégée.** `bat32_glitch_oracle_after_dip` (partagé par
+  `SWD GLITCH[ SWEEP]` **et** `TARGET GLITCH TEST/SWEEP`) lit la flash `0x0` avant la SRAM ; à niveau
+  protégé cette lecture **FAULT** et laisse **`STICKYERR`** posé dans le DP, ce qui faisait échouer la
+  lecture SRAM suivante **alors que la SRAM est lisible** ⇒ chaque tir verrouillé était mal classé
+  **`sram_lost`**. Mesuré au banc le 2026-09-24 : `SWD READ 0x20000008` rend une donnée en standalone,
+  tandis que l'oracle rendait `sram_lost` (rail au repos, `nRST_low=N`, aucun creux). Correctif :
+  `swd_clear_errors()` **entre** les deux lectures. Désormais cible protégée à SRAM lisible → **`locked`**,
+  et `sram_lost` reste réservé aux vrais échecs de lecture SRAM (brownout/POR). ⚠ Corrige aussi les
+  tallies faussés de `TARGET GLITCH TEST/SWEEP` (bug hérité de `bat32_glitch_shot`).
+
+### Changed
+- Version : `v0.7-JLQ_26/09/24-v2` → `v0.7-JLQ_26/09/24-v3`.
+
+## [0.7-JLQ_26/09/24-v2] — glitch de tension synchronisé sur nRST (SWD GLITCH / SWD GLITCH SWEEP)
+
+### Added
+- **`SWD GLITCH <delay_us> <volt> [DWELL <us>] [NOPWR]`** — un voltage glitch INTERNAL **synchronisé
+  sur le relâchement de nRST**, sur BAT32G135 (après `TARGET BAT32`, mode INTERNAL). Séquence par tir :
+  `[power-cycle]` → maintien nRST bas → relâchement → attente `delay_us` → creux du rail
+  (`power_glitch_once`) → oracle (flash `0x0` lisible + SRAM `0x20000008` vivante). Sur SUCCESS, la cible
+  est laissée **sous tension + connectée** pour un dump immédiat. C'est le chemin *reset-synchronisé*
+  que la limitation de `TARGET GLITCH TEST/SWEEP` (entrée précédente) signalait comme absent.
+- **`SWD GLITCH SWEEP <d0> <d1> <dstep> <thr0> <thr1> <thrstep> [SHOTS <n>] [DWELL <us>] [NOPWR]`** —
+  balayage **2D** : délai nRST→creux (externe) × profondeur du creux en **counts ADC** (interne),
+  `SHOTS` tirs/cellule. Arrêt au 1er SUCCESS, abandon sur touche, progression throttlée. Bornes :
+  200000 pts de délai × 4096 pts de seuil × 1000 shots, ≤ 2000000 tirs au total.
+- Mot-clé **`NOPWR`** : ne fait que pulser nRST par tir (rail alimenté une fois au début, vitesse
+  `SWD RACE`) au lieu d'un power-cycle complet — défaut = power-cycle par tir.
+
+### Changed
+- Version : `v0.7-JLQ_26/09/24` → `v0.7-JLQ_26/09/24-v2`.
+- Nouveau sous-verbe `SWD GLITCH` (21e de la table `swd_subcmds`), exclu de l'auto-connexion SWD (il
+  fait sa propre séquence power/reset/connect), HELP top-level + mini-help SWD mis à jour.
+- L'oracle post-creux de `bat32_glitch_shot` est factorisé (`bat32_glitch_oracle_after_dip`) et partagé
+  avec le nouveau chemin — comportement de `TARGET GLITCH TEST/SWEEP` **inchangé**.
+
+### Limitation (à ne pas découvrir au banc)
+- ⚠ **Synchro best-effort à l'échelle µs, pas cycle-exact.** Le creux est une opération CPU
+  (`gpio_clr_mask`), pas un événement PIO ; la synchro est en C ligne droite (`busy_wait_us_32`), et le
+  **préambule de `power_glitch_once`** (arm IRQ / flotte GP11-12 / sélection ADC) s'exécute *dans* la
+  fenêtre chronométrée, après l'attente — un **offset fixe de l'ordre de quelques µs, non mesuré**. La
+  fenêtre OCDEN ne faisant que quelques µs, mesurer cet offset à l'oscilloscope avant de conclure.
+- ⚠ **Aucune campagne tirée.** Ni fenêtre, ni offset, ni profondeur atteinte mesurés : cette entrée
+  apporte la *capacité de tirer synchronisé* + l'oracle, pas une défaite prouvée.
+- Le power-cycle 2D coûte ~0,4 s/tir (300 ms off + 100 ms settle) : une grille large se compte en
+  heures. `NOPWR` accélère mais suppose que nRST seul recharge OCDEN (non vérifié).
+
 ## [0.7-JLQ_26/09/24] — glitch de tension sur BAT32G135 (TARGET GLITCH TEST/SWEEP)
 
 ### Added

@@ -513,6 +513,65 @@ inspection, and read-only BAT32G135 option-byte decoding.
   `SUCCESS` (see above); aborts on any pending keypress. Prints throttled progress
   and a final summary. Example: `SWD RACE SWEEP 0 2000 1 SHOTS 3`.
 
+**`SWD GLITCH <delay_us> <volt> [DWELL <us>] [SETTLE <ms>] [NOPWR] [NORST]`** - Reset-synced voltage glitch (BAT32)
+- One INTERNAL voltage glitch **timed to the nRST release**, on the BAT32G135 (after
+  `TARGET BAT32`, INTERNAL power mode only). Per shot: `[power-cycle]` → hold nRST low →
+  release → wait `delay_us` → dip the rail (`power_glitch_once`, depth from `<volt>`) →
+  read the oracle. Unlike `TARGET GLITCH TEST/SWEEP`, whose dip runs mid-execution, this
+  one lands in the reset / option-byte (OCDEN) load window.
+- Oracle = code flash `0x0` readable **and** SRAM `0x20000008` alive = `SUCCESS`
+  (protection dropped). On `SUCCESS` the target is left **powered and connected** — dump
+  now, don't reset or power-cycle (Level 0 is lost at the next reset).
+- `DWELL <us>` holds the rail low past threshold (default 0). `NOPWR` pulses nRST only
+  (rail energised once at the start) instead of a full per-shot power-cycle (the default).
+- `NORST` leaves nRST untouched (no assert/release): the dip is then timed from the window
+  opening, **not** from a reset edge — so there is no reset-sync. Use it for free-running /
+  comparison shots (esp. `NOPWR NORST` = dip on the running target); for the OCDEN window
+  attack keep nRST active (the default).
+- `SETTLE <ms>` tunes the rail-settle after power-on inside the per-shot power-cycle (default
+  100, `0` = none); it only applies when the shot power-cycles (not under `NOPWR`), and it does
+  not change the global auto-power-on settle. `NORST SETTLE 0` fires the dip right after
+  power-on (POR-synced) instead of 100 ms later; a small `SETTLE` also just speeds up a
+  power-cycling campaign. ⚠ Too low in nRST-synced mode risks releasing nRST on a rail that
+  has not stabilised.
+- Does **not** require `SWD PHY PIO` (unlike `SWD RACE`): the dip is a CPU op, not a PIO
+  event. ⚠ Sync is best-effort at the microsecond scale — `power_glitch_once`'s preamble
+  runs inside the timed window, adding a fixed offset of order microseconds (unmeasured;
+  scope it before trusting a delay bin).
+
+**`SWD GLITCH SWEEP <d0> <d1> <dstep> <thr0> <thr1> <thrstep> [SHOTS <n>] [DWELL <us>] [SETTLE <ms>] [NOPWR] [NORST]`** - 2D sweep
+- Sweeps the nRST→dip delay (outer, µs) against the dip depth (inner, **ADC counts**
+  0–4095; higher count = shallower dip). `thr` is ADC counts, not volts, so the axis
+  steps exactly (no float drift); progress lines print the volt-equivalent. `SHOTS <n>`
+  attempts per cell (default 1).
+- Bounded to 200000 delay points x 4096 threshold points x 1000 shots, and ≤ 2000000
+  attempts total; stops on the first `SUCCESS` (target left powered + connected); aborts
+  on any pending keypress. Prints throttled progress and a final summary.
+- Example: `SWD GLITCH SWEEP 0 200 5 2400 3400 50 SHOTS 3` — delays 0..200µs step 5,
+  thresholds 2400..3400 counts step 50, 3 shots/cell. Add `NOPWR` for nRST-only speed.
+
+**`SWD GLITCH PIO <pause_cy> <width_cy> [NOPWR] [SETTLE <ms>]`** - Reset-synced PIO pulse (BAT32)
+- Fires the **PIO pulse engine**, reset-synchronised, instead of the slow INTERNAL sag: a **sub-µs**
+  pulse `pause_cy` cycles (6.67 ns each) after the target releases nRST, `width_cy` cycles wide, on
+  **GP2** (EMFI trigger, e.g. FaultyCat) **and GP11** (crowbar, in `TARGET POWER EXT`). Then the
+  flash/SRAM oracle.
+- ★ Why this beats the sag on the BAT32: the LVD and POR both need a **≥300 µs** excursion (datasheet
+  §6.8.5/§6.8.6), so a sub-µs pulse slips under them and can corrupt the OCDEN flash read without a
+  clean reset. (An EMFI pulse escapes the LVD/POR entirely — it doesn't touch VDD.)
+- **Requires a `GP15→GP3` strap** (bench wiring of `docs/08`): raiden arms `TRIGGER GPIO RISING` on
+  GP3 and the nRST-release edge on GP15 fires the pulse. Without it, the shot reports
+  `no trigger seen on GP3`.
+- **raiden holds TIME + ORACLE, the injector holds POWER**: for EMFI the FaultyCat must be armed
+  (fire) separately — raiden only makes the reset-synced trigger. The crowbar (GP11, `TARGET POWER
+  EXT`) is fully raiden-driven.
+
+**`SWD GLITCH PIO SWEEP <p0> <p1> <pstep> <w0> <w1> <wstep> [SHOTS <n>] [NOPWR] [SETTLE <ms>]`** - 2D sweep
+- Sweeps pause (outer) × width (inner), both in 6.67 ns cycles; `SHOTS <n>` per cell. Stops on the
+  first `SUCCESS` (target left connected); aborts on any keypress; throttled progress.
+- Example: `SWD GLITCH PIO SWEEP 60000 75000 150 15 300 15 SHOTS 3` — pause ~400..500 µs step 1 µs,
+  width ~0.1..2 µs step 0.1 µs. See the sizing rationale (≪300 µs width, ~450 µs pause anchor) in the
+  fault_injection `docs/BAT32_FACTS.md`.
+
 **`SWD IDCODE`** - Identify connected target
 - Reads DPIDR, CPUID, and STM32 debug ID code
 - Decodes ARM part number and STM32 device variant

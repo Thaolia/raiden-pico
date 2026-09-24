@@ -323,8 +323,8 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
                                           "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "RACE",
-                                          "PHY", "BENCH", "BAT32"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 20, "SWD sub-command")) {
+                                          "PHY", "BENCH", "BAT32", "GLITCH"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 21, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -514,6 +514,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("SWD PHY [BITBANG|PIO [<khz>]] - Get/set physical layer (def BITBANG)\r\n");
         uart_cli_send("SWD BENCH              - Time a fast connect+AHB-AP+read\r\n");
         uart_cli_send("SWD RACE [<delay_us>] / RACE SWEEP ... - Reset-release race (needs PHY PIO)\r\n");
+        uart_cli_send("SWD GLITCH [SWEEP] ...  - Reset-synced INTERNAL voltage glitch, BAT32 (INTERNAL mode)\r\n");
         uart_cli_send("SWD WRITE <addr|region> <val> - Write memory (auto-verify)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== JTAG Debug Interface (TCK=17, TMS=18, TDI=19, TDO=20, RTCK=21, TRST=15) ==\r\n");
@@ -531,7 +532,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/24\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/24-v6\r\n");
         // Quel lien porte cette CLI : c'est la seule facon de savoir, depuis
         // l'hote, quelle variante de binaire est reellement sur la puce.
 #if RAIDEN_CONSOLE_UART
@@ -2245,6 +2246,14 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("  SWD RACE [<delay_us>]    - One reset-release SWD race attempt\r\n");
             uart_cli_send("  SWD RACE SWEEP <start_us> <end_us> <step_us> [SHOTS <n>]\r\n");
             uart_cli_send("                            - Sweep the race delay, stop on first SUCCESS\r\n");
+            uart_cli_send("  SWD GLITCH <delay_us> <volt> [DWELL <us>] [SETTLE <ms>] [NOPWR] [NORST]\r\n");
+            uart_cli_send("                            - One reset-synced INTERNAL voltage glitch (BAT32); NORST=no reset, SETTLE 0=no rail-settle\r\n");
+            uart_cli_send("  SWD GLITCH SWEEP <d0> <d1> <dstep> <thr0> <thr1> <thrstep> [SHOTS <n>] [DWELL <us>] [SETTLE <ms>] [NOPWR] [NORST]\r\n");
+            uart_cli_send("                            - 2D sweep: nRST->dip delay x depth (ADC counts), stop on first SUCCESS\r\n");
+            uart_cli_send("  SWD GLITCH PIO <pause_cy> <width_cy> [NOPWR] [SETTLE <ms>]\r\n");
+            uart_cli_send("                            - One reset-synced PIO pulse (EMFI trig GP2 + crowbar GP11); needs GP15->GP3 strap\r\n");
+            uart_cli_send("  SWD GLITCH PIO SWEEP <p0> <p1> <pstep> <w0> <w1> <wstep> [SHOTS <n>] [NOPWR] [SETTLE <ms>]\r\n");
+            uart_cli_send("                            - 2D sweep pause x width (6.67ns cycles), sub-us pulse under the LVD/POR\r\n");
             uart_cli_send("  SWD REGS                 - Read core registers (r0-r15, xPSR)\r\n");
             uart_cli_send("  SWD RESET [ms|HOLD|RELEASE] - Target reset via nRST (default 100ms)\r\n");
             uart_cli_send("  SWD RESUME               - Resume target core\r\n");
@@ -2262,13 +2271,16 @@ void command_parser_execute(cmd_parts_t *parts) {
         // Auto-connect for all SWD commands except CONNECT, CONNECTRST, DISCONNECT,
         // RACE (races its own connect sequence — an auto-connect here would
         // defeat the entire point by connecting before the race starts),
-        // SPEED/PHY (pure config, no target access), and BENCH (times its
-        // own connect, same reasoning as RACE)
+        // GLITCH (does its own power-cycle/nRST/connect per shot — an auto-connect
+        // here would hold SWDIO/SWCLK high and stop the rail dropping, same
+        // reasoning as RACE), SPEED/PHY (pure config, no target access), and
+        // BENCH (times its own connect, same reasoning as RACE)
         if (strcmp(parts->parts[1], "CONNECT") != 0 &&
             strcmp(parts->parts[1], "CONNECTRST") != 0 &&
             strcmp(parts->parts[1], "DISCONNECT") != 0 &&
             strcmp(parts->parts[1], "BPTEST") != 0 &&
             strcmp(parts->parts[1], "RACE") != 0 &&
+            strcmp(parts->parts[1], "GLITCH") != 0 &&
             strcmp(parts->parts[1], "SPEED") != 0 &&
             strcmp(parts->parts[1], "PHY") != 0 &&
             strcmp(parts->parts[1], "BENCH") != 0) {
@@ -2611,6 +2623,237 @@ void command_parser_execute(cmd_parts_t *parts) {
                 api_error_printf("ERROR: SWD BENCH [%s] failed after %lu us "
                                   "(check target power and wiring)\r\n",
                                   phy_desc, (unsigned long)us);
+            }
+
+        } else if (strcmp(parts->parts[1], "GLITCH") == 0) {
+            // Reset-synchronised INTERNAL voltage glitch (BAT32). Times the rail
+            // dip to a controlled nRST release -- the OCDEN load window -- which
+            // TARGET GLITCH TEST/SWEEP cannot (their dip is not reset-synced). Does
+            // its own power/reset/connect (excluded from the auto-connect above)
+            // and does NOT require SWD PHY PIO, unlike RACE: the dip is a CPU op,
+            // not a PIO event, so there is no PIO timing to protect. All argument
+            // validation happens BEFORE any hardware is touched.
+            bool is_sweep = (parts->count >= 3 && strcmp(parts->parts[2], "SWEEP") == 0);
+            uint32_t dwell_us = 0;
+            bool power_cycle = true;   // default: full power-cycle per shot; NOPWR disables
+            bool use_nrst = true;      // default: assert/release nRST (reset-sync); NORST disables
+            uint32_t settle_ms = SWD_GLITCH_DEFAULT_SETTLE_MS;  // rail-settle after power-on; SETTLE 0 removes it
+
+            // PIO reset-synced variant: a sub-us pulse on GP2 (EMFI trigger) + GP11 (crowbar in
+            // TARGET POWER EXT), fired on the nRST-release edge via a GP15->GP3 strap. Slips
+            // under the LVD/POR (both need >=300us). Params are in 6.67ns PIO cycles.
+            if (parts->count >= 3 && strcmp(parts->parts[2], "PIO") == 0) {
+                bool pio_sweep = (parts->count >= 4 && strcmp(parts->parts[3], "SWEEP") == 0);
+                if (pio_sweep) {
+                    // SWD GLITCH PIO SWEEP <p0> <p1> <pstep> <w0> <w1> <wstep> [SHOTS <n>] [NOPWR] [SETTLE <ms>]
+                    uint32_t p0 = 0, p1 = 0, ps = 0, w0 = 0, w1 = 0, ws = 0, shots = 1;
+                    if (parts->count < 10) {
+                        api_error("ERROR: Usage: SWD GLITCH PIO SWEEP <p0> <p1> <pstep> <w0> <w1> <wstep> "
+                                  "[SHOTS <n>] [NOPWR] [SETTLE <ms>] (cycles, 6.67ns each)\r\n");
+                        goto api_response;
+                    }
+                    if (!parse_u32(parts->parts[4], 0, &p0) || !parse_u32(parts->parts[5], 0, &p1) ||
+                        !parse_u32(parts->parts[6], 0, &ps) || !parse_u32(parts->parts[7], 0, &w0) ||
+                        !parse_u32(parts->parts[8], 0, &w1) || !parse_u32(parts->parts[9], 0, &ws)) {
+                        api_error("ERROR: Invalid PIO SWEEP argument (expected 6 cycle values)\r\n");
+                        goto api_response;
+                    }
+                    for (uint8_t i = 10; i < parts->count; i++) {
+                        if (strcmp(parts->parts[i], "NOPWR") == 0) {
+                            power_cycle = false;
+                        } else if (strcmp(parts->parts[i], "SHOTS") == 0) {
+                            if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &shots)) {
+                                api_error("ERROR: SHOTS requires a count. Usage: ... SHOTS <n>\r\n");
+                                goto api_response;
+                            }
+                        } else if (strcmp(parts->parts[i], "SETTLE") == 0) {
+                            if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &settle_ms)) {
+                                api_error("ERROR: SETTLE requires a value in ms (0 = none). Usage: ... SETTLE <ms>\r\n");
+                                goto api_response;
+                            }
+                        } else {
+                            api_error_printf("ERROR: Unknown SWD GLITCH PIO SWEEP option '%s'\r\n", parts->parts[i]);
+                            goto api_response;
+                        }
+                    }
+                    if (p1 < p0 || ps == 0 || w1 < w0 || ws == 0) {
+                        api_error("ERROR: Invalid PIO SWEEP range (need p1>=p0, w1>=w0, steps>0)\r\n");
+                        goto api_response;
+                    }
+                    uint32_t n_pause = (p1 - p0) / ps + 1;
+                    uint32_t n_width = (w1 - w0) / ws + 1;
+                    if (shots == 0 || shots > SWD_GLITCH_SWEEP_MAX_SHOTS ||
+                        n_pause > SWD_GLITCH_SWEEP_MAX_DELAY_POINTS ||
+                        n_width > SWD_GLITCH_SWEEP_MAX_DELAY_POINTS ||
+                        (uint64_t)n_pause * n_width * shots > SWD_GLITCH_SWEEP_MAX_TOTAL) {
+                        api_error_printf("ERROR: PIO SWEEP too large (max %lu pause pts x %lu width pts x "
+                                         "%lu shots, <= %lu total)\r\n",
+                                         (unsigned long)SWD_GLITCH_SWEEP_MAX_DELAY_POINTS,
+                                         (unsigned long)SWD_GLITCH_SWEEP_MAX_DELAY_POINTS,
+                                         (unsigned long)SWD_GLITCH_SWEEP_MAX_SHOTS,
+                                         (unsigned long)SWD_GLITCH_SWEEP_MAX_TOTAL);
+                        goto api_response;
+                    }
+                    uart_cli_printf("SWD GLITCH PIO SWEEP: pause %lu..%lu step %lu x width %lu..%lu step %lu cy, "
+                                    "%lu shot(s)/cell (%lu attempts) %s -- needs GP15->GP3 strap + FaultyCat armed; "
+                                    "any key aborts\r\n",
+                                    (unsigned long)p0, (unsigned long)p1, (unsigned long)ps,
+                                    (unsigned long)w0, (unsigned long)w1, (unsigned long)ws,
+                                    (unsigned long)shots, (unsigned long)(n_pause * n_width * shots),
+                                    power_cycle ? "power-cycle/shot" : "NOPWR");
+                    bool ok = target_bat32_glitch_pio_sweep(p0, p1, ps, w0, w1, ws, shots,
+                                                            power_cycle, settle_ms);
+                    if (ok) {
+                        uart_cli_send("OK: SWD GLITCH PIO SWEEP success -- target left powered + connected, dump now\r\n");
+                    } else {
+                        api_error("ERROR: SWD GLITCH PIO SWEEP finished without a SUCCESS (see log above)\r\n");
+                    }
+                } else {
+                    // SWD GLITCH PIO <pause_cy> <width_cy> [NOPWR] [SETTLE <ms>]
+                    uint32_t pause_cy = 0, width_cy = 0;
+                    if (parts->count < 5) {
+                        api_error("ERROR: Usage: SWD GLITCH PIO <pause_cy> <width_cy> [NOPWR] [SETTLE <ms>] "
+                                  "(cycles, 6.67ns each)\r\n");
+                        goto api_response;
+                    }
+                    if (!parse_u32(parts->parts[3], 0, &pause_cy) || !parse_u32(parts->parts[4], 0, &width_cy)) {
+                        api_error("ERROR: Invalid pause/width (expected cycle values)\r\n");
+                        goto api_response;
+                    }
+                    for (uint8_t i = 5; i < parts->count; i++) {
+                        if (strcmp(parts->parts[i], "NOPWR") == 0) {
+                            power_cycle = false;
+                        } else if (strcmp(parts->parts[i], "SETTLE") == 0) {
+                            if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &settle_ms)) {
+                                api_error("ERROR: SETTLE requires a value in ms (0 = none). Usage: ... SETTLE <ms>\r\n");
+                                goto api_response;
+                            }
+                        } else {
+                            api_error_printf("ERROR: Unknown SWD GLITCH PIO option '%s'\r\n", parts->parts[i]);
+                            goto api_response;
+                        }
+                    }
+                    target_bat32_glitch_pio(pause_cy, width_cy, power_cycle, settle_ms);
+                }
+                goto api_response;
+            }
+
+            if (is_sweep) {
+                // SWD GLITCH SWEEP <d0> <d1> <dstep> <thr0> <thr1> <thrstep> [SHOTS <n>] [DWELL <us>] [NOPWR]
+                uint32_t d0 = 0, d1 = 0, ds = 0, t0 = 0, t1 = 0, ts = 0, shots = 1;
+                if (parts->count < 9) {
+                    api_error("ERROR: Usage: SWD GLITCH SWEEP <d0_us> <d1_us> <dstep_us> "
+                              "<thr0> <thr1> <thrstep> [SHOTS <n>] [DWELL <us>] [SETTLE <ms>] [NOPWR] [NORST]\r\n");
+                    goto api_response;
+                }
+                if (!parse_u32(parts->parts[3], 0, &d0) || !parse_u32(parts->parts[4], 0, &d1) ||
+                    !parse_u32(parts->parts[5], 0, &ds) || !parse_u32(parts->parts[6], 0, &t0) ||
+                    !parse_u32(parts->parts[7], 0, &t1) || !parse_u32(parts->parts[8], 0, &ts)) {
+                    api_error("ERROR: Invalid SWEEP argument (expected <d0> <d1> <dstep> <thr0> <thr1> "
+                              "<thrstep>, all decimal or 0x-prefixed; thr in ADC counts)\r\n");
+                    goto api_response;
+                }
+                // Optional trailing tokens from index 9: SHOTS <n>, DWELL <us>, NOPWR (any order).
+                for (uint8_t i = 9; i < parts->count; i++) {
+                    if (strcmp(parts->parts[i], "NOPWR") == 0) {
+                        power_cycle = false;
+                    } else if (strcmp(parts->parts[i], "NORST") == 0) {
+                        use_nrst = false;
+                    } else if (strcmp(parts->parts[i], "SHOTS") == 0) {
+                        if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &shots)) {
+                            api_error("ERROR: SHOTS requires a count. Usage: ... SHOTS <n>\r\n");
+                            goto api_response;
+                        }
+                    } else if (strcmp(parts->parts[i], "DWELL") == 0) {
+                        if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &dwell_us)) {
+                            api_error("ERROR: DWELL requires a value in us. Usage: ... DWELL <us>\r\n");
+                            goto api_response;
+                        }
+                    } else if (strcmp(parts->parts[i], "SETTLE") == 0) {
+                        if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &settle_ms)) {
+                            api_error("ERROR: SETTLE requires a value in ms (0 = none). Usage: ... SETTLE <ms>\r\n");
+                            goto api_response;
+                        }
+                    } else {
+                        api_error_printf("ERROR: Unknown SWD GLITCH SWEEP option '%s'\r\n", parts->parts[i]);
+                        goto api_response;
+                    }
+                }
+                if (d1 < d0 || ds == 0) {
+                    api_error("ERROR: Invalid delay range (need d1 >= d0 and dstep > 0)\r\n");
+                    goto api_response;
+                }
+                if (t1 < t0 || ts == 0 || t1 > 4095) {
+                    api_error("ERROR: Invalid threshold range (need 0 <= thr0 <= thr1 <= 4095 and "
+                              "thrstep > 0; threshold is ADC counts)\r\n");
+                    goto api_response;
+                }
+                uint32_t n_delay = (d1 - d0) / ds + 1;
+                uint32_t n_thr   = (t1 - t0) / ts + 1;
+                if (shots == 0 || shots > SWD_GLITCH_SWEEP_MAX_SHOTS ||
+                    n_delay > SWD_GLITCH_SWEEP_MAX_DELAY_POINTS ||
+                    n_thr > SWD_GLITCH_SWEEP_MAX_THR_POINTS ||
+                    (uint64_t)n_delay * n_thr * shots > SWD_GLITCH_SWEEP_MAX_TOTAL) {
+                    api_error_printf("ERROR: SWEEP too large (max %lu delay pts x %lu thr pts x %lu "
+                                     "shots, <= %lu attempts total)\r\n",
+                                     (unsigned long)SWD_GLITCH_SWEEP_MAX_DELAY_POINTS,
+                                     (unsigned long)SWD_GLITCH_SWEEP_MAX_THR_POINTS,
+                                     (unsigned long)SWD_GLITCH_SWEEP_MAX_SHOTS,
+                                     (unsigned long)SWD_GLITCH_SWEEP_MAX_TOTAL);
+                    goto api_response;
+                }
+
+                // Arguments valid -- from here on this touches hardware.
+                uart_cli_printf("SWD GLITCH SWEEP: delay %lu..%luus step %lu x thr %lu..%lu step %lu, "
+                                "%lu shot(s)/cell (%lu attempts) %s %s settle=%lums -- any key aborts\r\n",
+                                (unsigned long)d0, (unsigned long)d1, (unsigned long)ds,
+                                (unsigned long)t0, (unsigned long)t1, (unsigned long)ts,
+                                (unsigned long)shots, (unsigned long)(n_delay * n_thr * shots),
+                                power_cycle ? "power-cycle/shot" : "NOPWR",
+                                use_nrst ? "nRST-synced" : "NORST",
+                                (unsigned long)(power_cycle ? settle_ms : 0u));
+                bool ok = target_bat32_glitch_sync_sweep(d0, d1, ds, t0, t1, ts, shots,
+                                                         dwell_us, power_cycle, use_nrst, settle_ms);
+                if (ok) {
+                    uart_cli_send("OK: SWD GLITCH SWEEP success at the delay/threshold reported above "
+                                  "-- target left powered + connected, dump now\r\n");
+                } else {
+                    api_error("ERROR: SWD GLITCH SWEEP finished without a SUCCESS (see log above)\r\n");
+                }
+            } else {
+                // Single shot (calibration): SWD GLITCH <delay_us> <volt> [DWELL <us>] [NOPWR]
+                uint32_t delay_us = 0;
+                if (parts->count < 4) {
+                    api_error("ERROR: Usage: SWD GLITCH <delay_us> <volt> [DWELL <us>] [SETTLE <ms>] [NOPWR] [NORST]\r\n");
+                    goto api_response;
+                }
+                if (!parse_u32(parts->parts[2], 0, &delay_us)) {
+                    api_error("ERROR: Invalid delay_us. Usage: SWD GLITCH <delay_us> <volt> "
+                              "[DWELL <us>] [SETTLE <ms>] [NOPWR] [NORST]\r\n");
+                    goto api_response;
+                }
+                float voltage = strtof(parts->parts[3], NULL);  // range (0<V<=3.3) checked in target fn
+                for (uint8_t i = 4; i < parts->count; i++) {
+                    if (strcmp(parts->parts[i], "NOPWR") == 0) {
+                        power_cycle = false;
+                    } else if (strcmp(parts->parts[i], "NORST") == 0) {
+                        use_nrst = false;
+                    } else if (strcmp(parts->parts[i], "DWELL") == 0) {
+                        if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &dwell_us)) {
+                            api_error("ERROR: DWELL requires a value in us. Usage: ... DWELL <us>\r\n");
+                            goto api_response;
+                        }
+                    } else if (strcmp(parts->parts[i], "SETTLE") == 0) {
+                        if (i + 1 >= parts->count || !parse_u32(parts->parts[++i], 0, &settle_ms)) {
+                            api_error("ERROR: SETTLE requires a value in ms (0 = none). Usage: ... SETTLE <ms>\r\n");
+                            goto api_response;
+                        }
+                    } else {
+                        api_error_printf("ERROR: Unknown SWD GLITCH option '%s'\r\n", parts->parts[i]);
+                        goto api_response;
+                    }
+                }
+                target_bat32_glitch_sync(delay_us, voltage, dwell_us, power_cycle, use_nrst, settle_ms);
             }
 
         } else if (strcmp(parts->parts[1], "RACE") == 0) {
