@@ -532,7 +532,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/24-v6\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/30-v6\r\n");
         // Quel lien porte cette CLI : c'est la seule facon de savoir, depuis
         // l'hote, quelle variante de binaire est reellement sur la puce.
 #if RAIDEN_CONSOLE_UART

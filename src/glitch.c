@@ -234,7 +234,12 @@ bool glitch_arm(void) {
         return false;  // Already armed
     }
 
-    // Clear GLITCH_FIRED from previous trigger (if any)
+    // Clear GLITCH_FIRED from previous trigger (if any).
+    // Reclaim GP22 from PIO to SIO first: after the previous arm the pin is
+    // PIO-muxed, and a bare gpio_put() on a PIO-muxed pin is a no-op, so GP22
+    // stayed HIGH and a rising-edge consumer missed every trigger after the first.
+    gpio_init(PIN_GLITCH_FIRED);
+    gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
     gpio_put(PIN_GLITCH_FIRED, 0);
 
     // Disable all trigger state machines first to ensure clean state
@@ -468,7 +473,12 @@ bool glitch_arm_trace(void) {
         return false;
     }
 
-    // Clear GLITCH_FIRED
+    // Clear GLITCH_FIRED. Reclaim GP22 from PIO to SIO first: after the previous
+    // ARM TRACE the pin is PIO-muxed, and a bare gpio_put() on a PIO-muxed pin is
+    // a no-op, so GP22 stayed HIGH and the trace's rising-edge GP22 ISR missed
+    // every trigger after the first (single-shot trace worked, repeats did not).
+    gpio_init(PIN_GLITCH_FIRED);
+    gpio_set_dir(PIN_GLITCH_FIRED, GPIO_OUT);
     gpio_put(PIN_GLITCH_FIRED, 0);
 
     // Disable all trigger state machines
