@@ -321,10 +321,10 @@ void command_parser_execute(cmd_parts_t *parts) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
-            const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "READ", "WRITE", "FILL", "IDCODE",
+            const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "DISCONNECT", "READ", "WRITE", "FILL", "IDCODE",
                                           "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "RACE",
                                           "PHY", "BENCH", "BAT32", "GLITCH"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 21, "SWD sub-command")) {
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 22, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
@@ -532,7 +532,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/30-v6\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/30-v7\r\n");
         // Quel lien porte cette CLI : c'est la seule facon de savoir, depuis
         // l'hote, quelle variante de binaire est reellement sur la puce.
 #if RAIDEN_CONSOLE_UART

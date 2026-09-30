@@ -16,6 +16,17 @@ was started at v0.7, so pre-0.6 entries are summarized from git history.
 > ce sont des notes prises au banc, elles restent le journal de développement du
 > fork.
 
+## [0.7-JLQ_26/09/30-v7] — `SWD DISCONNECT` rejeté par le portillon de validation
+
+### Fixed
+- **`SWD DISCONNECT` fonctionne à nouveau.** La sous-commande était gérée par l'exécuteur
+  (`swd_deinit()` → SWCLK/SWDIO en haute impédance) et annoncée par le HELP, mais **absente de la
+  liste blanche `swd_subcmds[]`** du portillon d'abréviation : toute saisie rendait
+  `ERROR: Unknown SWD sub-command 'DISCONNECT'` avant même d'atteindre le handler. Ajoutée à la
+  liste (count 21 → 22, aux côtés de `GLITCH`). Sans elle, impossible de relâcher les lignes SWD en
+  haute-Z avant une coupure d'alimentation — le debugger tient alors SWDIO à 3,3 V et réalimente la
+  cible par ses diodes de protection (mesuré au banc : 0,74 V sur VDD alors que le relais est OFF).
+
 ## [0.7-JLQ_26/09/24-v6] — SWD GLITCH PIO : impulsion PIO reset-synchronisée (EMFI + crowbar)
 
 ### Added

@@ -491,6 +491,11 @@ inspection, and read-only BAT32G135 option-byte decoding.
   per its user manual) don't. For those, use `SWD RACE` instead — same goal, opposite
   timing: it releases nRST *first*, then races to connect.
 
+**`SWD DISCONNECT`** - Disconnect and release the SWD pins to high-impedance
+- Powers down the debug domain, clears sticky errors, then tri-states SWCLK/SWDIO
+- Use it before a target power-off so the Pico stops holding SWDIO at 3.3 V and
+  back-powering the target through its ESD protection diodes (the "cut that doesn't cut")
+
 **`SWD RACE [<delay_us>]`** - Reset-release race
 - Asserts nRST, releases it, waits **exactly** `delay_us` (no clamping, no implicit
   compensation), then races to connect + bring up the AHB-AP + read the reset vector

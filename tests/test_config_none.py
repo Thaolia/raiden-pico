@@ -502,6 +502,25 @@ class TestSWDSpeed:
         raiden.cmd("SWD SPEED 1")
 
 
+# ── SWD DISCONNECT ───────────────────────────────────────────
+# Regression guard: DISCONNECT is handled by the executor (swd_deinit -> pins
+# high-Z) and listed in HELP, but was missing from the swd_subcmds[] whitelist,
+# so the abbreviation gate rejected it with "Unknown SWD sub-command" before it
+# ever ran. Pure config: it only releases the SWD pins (swd_deinit early-returns
+# when not connected), so no target is needed.
+
+class TestSWDDisconnect:
+
+    def test_disconnect_is_accepted(self, raiden):
+        r = raiden.cmd("SWD DISCONNECT")
+        assert "ERROR" not in r
+        assert "disconnected" in r.lower()
+
+    def test_unknown_swd_subcommand_still_errors(self, raiden):
+        r = raiden.cmd("SWD WIBBLE")
+        assert "ERROR" in r and "Unknown" in r
+
+
 # ── SWD PHY (bit-bang vs. PIO physical layer) ─────────
 # SWD PHY PIO only records mode + frequency (the PIO program itself is
 # claimed lazily inside swd_connect_ex()) -- safe with no target wired,
