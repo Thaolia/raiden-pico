@@ -201,6 +201,18 @@ bool swd_write_dp(uint8_t addr, uint32_t value);
 // addr: register address within AP
 bool swd_read_ap(uint8_t ap, uint8_t addr, uint32_t *value);
 
+// Enumerate the DAP: Access Ports + CoreSight ROM table (see swd.c). SWD-only;
+// no JTAG required. Auto-connect is handled by the SWD command dispatcher.
+void swd_scan(void);
+
+// Diffable capture of non-flash observable state (core regs + SCB fault status +
+// key peripherals + SRAM window). Fault-tolerant per read (works at RDP0/RDP1).
+void swd_snapshot(uint32_t sram_addr, uint32_t sram_len);
+
+// Atomic flash-read-leak probe: MEM-AP read of addr + capture of raw data phase /
+// RDBUFF / sticky state with no intervening error-clear. See RDP1_DEBUG_MATRIX.md.
+void swd_leakprobe(uint32_t addr);
+
 // Write Access Port register
 bool swd_write_ap(uint8_t ap, uint8_t addr, uint32_t value);
 

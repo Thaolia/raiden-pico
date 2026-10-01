@@ -9,6 +9,7 @@
 #include "net_cli.h"
 #include "swd_phy.h"
 #include "bat32_target.h"
+#include "uart_cli.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/timer.h"
@@ -1769,12 +1770,14 @@ bool swd_bat32_read_options(const bat32_target_info_t *info) {
 // --- STM32 flash operations ---
 
 bool swd_stm32_flash_wait(const stm32_target_info_t *info, uint32_t timeout_ms) {
+    // BSY bit position differs by family: F1/F3 = SR bit 0; F4/L4 = SR bit 16.
+    uint32_t bsy = (info->flash_optr == 0x4002201C) ? (1u << 0) : (1u << 16);
     uint32_t start = to_ms_since_boot(get_absolute_time());
     while (to_ms_since_boot(get_absolute_time()) - start < timeout_ms) {
         uint32_t sr;
         if (!mem_read32(info->flash_sr, &sr))
             return false;
-        if (!(sr & 0x1))  // BSY bit
+        if (!(sr & bsy))
             return true;
         sleep_us(100);
     }
@@ -1785,22 +1788,29 @@ bool swd_stm32_flash_unlock(const stm32_target_info_t *info) {
     // Clear sticky errors
     swd_write_dp(DP_ABORT, 0x1E);
 
+    // LOCK bit: F1/F3 = bit 7; L4/F4 = bit 31.
+    uint32_t lock = (info->flash_base == 0x40022000) ? (1u << 7) : (1u << 31);
+
+    uint32_t cr;
+    if (!mem_read32(info->flash_cr, &cr))
+        return false;
+
+    // IDEMPOTENT: if already unlocked, do NOT re-write KEYR. On F4, writing the
+    // key sequence to an already-unlocked KEYR re-locks FLASH_CR (and can bus-fault),
+    // which is why a double-unlock (erase then write) failed on F4 but not F1.
+    if (!(cr & lock))
+        return true;
+
     // Write key sequence to FLASH_KEYR
     if (!mem_write32(info->flash_keyr, info->flash_key1))
         return false;
     if (!mem_write32(info->flash_keyr, info->flash_key2))
         return false;
 
-    // Verify unlock by reading CR — LOCK bit should be clear
-    uint32_t cr;
+    // Verify unlock
     if (!mem_read32(info->flash_cr, &cr))
         return false;
-
-    // F1/F3: LOCK is bit 7; L4: bit 31; F4: bit 31
-    if (info->flash_base == 0x40022000)
-        return !(cr & (1u << 7));    // F1/F3
-    else
-        return !(cr & (1u << 31));   // L4/F4
+    return !(cr & lock);
 }
 
 static bool stm32_opt_unlock(const stm32_target_info_t *info) {
@@ -2191,13 +2201,20 @@ bool swd_stm32_flash_erase_page(const stm32_target_info_t *info, uint32_t page) 
         if (!mem_write32(info->flash_cr, cr))
             return false;
     }
-    // F4: sector erase via OPTCR — different model, use SNB field
+    // F4: sector erase (SER + SNB[6:3]) with PSIZE=x32. Clear sticky SR error/EOP
+    // flags first (they block new operations), and clear CR (SER/SNB) afterward so
+    // a following program (PG) starts clean.
     else {
-        uint32_t cr = (page << 3)       // SNB
-                    | (1 << 1)          // SER
-                    | (1 << 16);        // STRT
+        mem_write32(info->flash_sr, 0x1F3);   // clear EOP/OPERR/WRPERR/PGAERR/PGPERR/PGSERR/RDERR
+        uint32_t cr = (2u << 8)         // PSIZE = x32
+                    | ((page & 0xF) << 3) // SNB
+                    | (1u << 1)          // SER
+                    | (1u << 16);        // STRT
         if (!mem_write32(info->flash_cr, cr))
             return false;
+        bool ok = swd_stm32_flash_wait(info, 5000);
+        mem_write32(info->flash_cr, 0);   // clear SER/SNB
+        return ok;
     }
 
     return swd_stm32_flash_wait(info, 5000);
@@ -2255,6 +2272,7 @@ uint32_t swd_stm32_flash_write(const stm32_target_info_t *info, uint32_t addr,
     }
     // F4: word (32-bit) programming with PSIZE
     else {
+        mem_write32(info->flash_sr, 0x1F3);  // clear sticky SR error/EOP flags first
         // PG | PSIZE=2 (32-bit)
         if (!mem_write32(info->flash_cr, (1 << 0) | (2 << 8)))
             return 0;
@@ -2273,4 +2291,237 @@ uint32_t swd_stm32_flash_write(const stm32_target_info_t *info, uint32_t addr,
     }
 
     return written;
+}
+
+// ---------------------------------------------------------------------------
+// SWD SCAN — enumerate the ADIv5 DAP: Access Ports + CoreSight ROM table.
+// Everything here is reached through the DAP, so SWD alone is sufficient — JTAG
+// is not needed (it would only add boundary-scan / multi-TAP chains).
+// Application peripherals (USART/I2C/GPIO) are NOT CoreSight components and have
+// no ID registers, so they do not appear here; only debug/CoreSight blocks do.
+// ---------------------------------------------------------------------------
+#define AP_BASE_REG 0xF8
+
+static uint32_t scan_rd32(uint32_t addr) {
+    uint32_t v = 0xFFFFFFFF;
+    swd_read_mem(addr, &v, 1);   // AP0 (the STM32 AHB-AP)
+    return v;
+}
+
+// Name a CoreSight component by its ARMv7-M debug base address (primary hint),
+// falling back to the raw part number the caller prints.
+static const char *scan_component_name(uint32_t base) {
+    switch (base & 0xFFFFF000) {
+        case 0xE0000000: return "ITM";
+        case 0xE0001000: return "DWT";
+        case 0xE0002000: return "FPB/BPU";
+        case 0xE000E000: return "SCS (NVIC/SCB/SysTick)";
+        case 0xE0040000: return "TPIU";
+        case 0xE0041000: return "ETM";
+        case 0xE0042000: return "DBGMCU";
+        case 0xE00FF000: return "ROM table";
+        default:         return "?";
+    }
+}
+
+static const char *scan_ap_type(uint8_t cls, uint8_t type) {
+    if (cls == 8) {               // MEM-AP class
+        switch (type) {
+            case 1: return "MEM-AP (AHB)";
+            case 2: return "MEM-AP (APB)";
+            case 4: return "MEM-AP (AXI)";
+            default: return "MEM-AP";
+        }
+    }
+    if (cls == 0 && type == 0) return "JTAG-AP";
+    return "AP";
+}
+
+static void scan_walk_rom(uint32_t rom) {
+    uart_cli_printf("  ROM table @0x%08lX:\r\n", (unsigned long)rom);
+    for (int i = 0; i < 128; i++) {
+        uint32_t e = scan_rd32(rom + i * 4);
+        if (e == 0) break;                 // final entry
+        if (!(e & 1)) continue;            // entry not present
+        int32_t off = (int32_t)(e & 0xFFFFF000);
+        uint32_t comp = rom + off;
+        uint32_t pid0 = scan_rd32(comp + 0xFE0) & 0xFF;
+        uint32_t pid1 = scan_rd32(comp + 0xFE4) & 0xFF;
+        uint32_t cid1 = scan_rd32(comp + 0xFF4) & 0xFF;
+        uint16_t part = (uint16_t)(pid0 | ((pid1 & 0xF) << 8));
+        uint8_t  cclass = (cid1 >> 4) & 0xF;
+        uart_cli_printf("    @0x%08lX part=0x%03X class=0x%X %s\r\n",
+                        (unsigned long)comp, part, cclass, scan_component_name(comp));
+    }
+}
+
+void swd_scan(void) {
+    uint32_t dpidr = 0;
+    swd_read_dp(DP_DPIDR, &dpidr);
+    uart_cli_printf("DPIDR=0x%08lX\r\n", (unsigned long)dpidr);
+
+    // Power up the debug + system domains so AP register access works. (mem
+    // reads normally do this via swd_init_ahb_ap, but SCAN reads AP IDRs first.)
+    swd_write_dp(DP_CTRL_STAT, 0x50000000);  // CDBGPWRUPREQ | CSYSPWRUPREQ
+    uint32_t stat = 0;
+    for (int i = 0; i < 100; i++) {
+        if (swd_read_dp(DP_CTRL_STAT, &stat) && (stat & 0xA0000000) == 0xA0000000)
+            break;
+    }
+
+    uart_cli_send("Scanning Access Ports (0..7)...\r\n");
+
+    int found = 0;
+    for (uint8_t ap = 0; ap < 8; ap++) {
+        uint32_t idr = 0;
+        if (!swd_read_ap(ap, AP_IDR, &idr) || idr == 0)
+            continue;
+        found++;
+        uint8_t cls  = (idr >> 13) & 0xF;
+        uint8_t type = idr & 0xF;
+        uart_cli_printf("AP%u IDR=0x%08lX (%s)\r\n", ap, (unsigned long)idr, scan_ap_type(cls, type));
+        if (cls == 8) {                              // MEM-AP -> has a BASE/ROM
+            uint32_t base = 0;
+            swd_read_ap(ap, AP_BASE_REG, &base);
+            uart_cli_printf("  BASE=0x%08lX\r\n", (unsigned long)base);
+            if (base == 0xFFFFFFFF || base == 0) {
+                uart_cli_send("  (no debug ROM entry)\r\n");
+            } else if (ap == 0) {
+                scan_walk_rom(base & 0xFFFFF000);    // ROM walk uses AP0 mem reads
+            } else {
+                uart_cli_send("  (ROM walk supported on AP0 only)\r\n");
+            }
+        }
+    }
+    if (!found) uart_cli_send("No Access Ports responded\r\n");
+    uart_cli_send("SWD SCAN complete\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// SWD SNAPSHOT — diffable capture of the target's non-flash observable state
+// (core regs + SCB fault status + key peripherals + SRAM window). Every read is
+// fault-tolerant: a blocked address prints "=FAULT" and the DP is recovered, so
+// the same command works at RDP0 and RDP1. See RDP1_DEBUG_MATRIX.md.
+// ---------------------------------------------------------------------------
+static void snap_reg(const char *key, uint32_t addr) {
+    uint32_t v = 0;
+    if (swd_read_mem(addr, &v, 1) == 1) {
+        uart_cli_printf("%s=0x%08lX\r\n", key, (unsigned long)v);
+    } else {
+        uart_cli_printf("%s=FAULT\r\n", key);
+        swd_clear_errors();
+    }
+}
+
+void swd_snapshot(uint32_t sram_addr, uint32_t sram_len) {
+    // Remember prior run state so we can restore it.
+    uint32_t dhcsr = 0;
+    bool was_halted = false;
+    if (swd_read_mem(0xE000EDF0, &dhcsr, 1) == 1)
+        was_halted = (dhcsr & (1u << 17)) != 0;   // S_HALT
+
+    swd_halt();
+    sleep_ms(5);
+
+    // RDP hint: is the flash domain readable right now?
+    uint32_t probe = 0;
+    bool flash_locked = (swd_read_mem(0x08000000, &probe, 1) != 1);
+    if (flash_locked) swd_clear_errors();
+    dhcsr = 0; swd_read_mem(0xE000EDF0, &dhcsr, 1);
+    uart_cli_printf("# SWD SNAPSHOT rdp=%d halted=%d\r\n",
+                    flash_locked ? 1 : 0, (dhcsr & (1u << 17)) ? 1 : 0);
+
+    // Core registers (0..18 = r0-r12, sp, lr, pc, xPSR, MSP, PSP; 20 = CONTROL).
+    static const char *rn[] = {"r0","r1","r2","r3","r4","r5","r6","r7","r8","r9",
+                               "r10","r11","r12","sp","lr","pc","xpsr","msp","psp"};
+    for (int i = 0; i <= 18; i++) {
+        uint32_t v = 0;
+        if (swd_read_core_reg(i, &v)) uart_cli_printf("REG.%s=0x%08lX\r\n", rn[i], (unsigned long)v);
+        else { uart_cli_printf("REG.%s=FAULT\r\n", rn[i]); swd_clear_errors(); }
+    }
+    { uint32_t v = 0;
+      if (swd_read_core_reg(20, &v)) uart_cli_printf("REG.ctrl=0x%08lX\r\n", (unsigned long)v);
+      else { uart_cli_send("REG.ctrl=FAULT\r\n"); swd_clear_errors(); } }
+
+    // Memory-mapped debug + fault + peripheral state.
+    snap_reg("SCB.CFSR",      0xE000ED28);
+    snap_reg("SCB.HFSR",      0xE000ED2C);
+    snap_reg("SCB.DFSR",      0xE000ED30);
+    snap_reg("SCB.MMFAR",     0xE000ED34);
+    snap_reg("SCB.BFAR",      0xE000ED38);
+    snap_reg("DBG.DHCSR",     0xE000EDF0);
+    snap_reg("DBG.DEMCR",     0xE000EDFC);
+    snap_reg("RCC.CR",        0x40023800);
+    snap_reg("RCC.CFGR",      0x40023808);
+    snap_reg("FLASH.ACR",     0x40023C00);
+    snap_reg("FLASH.OPTCR",   0x40023C14);
+    snap_reg("PWR.CR",        0x40007000);
+    snap_reg("PWR.CSR",       0x40007004);
+    snap_reg("DBGMCU.IDCODE", 0xE0042000);
+    snap_reg("GPIOA.MODER",   0x40020000);
+    snap_reg("GPIOB.MODER",   0x40020400);
+    snap_reg("GPIOC.MODER",   0x40020800);
+
+    // SRAM window (per-word, fault-tolerant).
+    if (sram_len == 0) sram_len = 256;
+    if (sram_len > 4096) sram_len = 4096;
+    uint32_t words = (sram_len + 3) / 4;
+    for (uint32_t i = 0; i < words; i++) {
+        uint32_t a = sram_addr + i * 4, v = 0;
+        if ((i % 4) == 0) uart_cli_printf("SRAM 0x%08lX:", (unsigned long)a);
+        if (swd_read_mem(a, &v, 1) == 1) uart_cli_printf(" %08lX", (unsigned long)v);
+        else { uart_cli_send(" FAULT"); swd_clear_errors(); }
+        if ((i % 4) == 3 || i == words - 1) uart_cli_send("\r\n");
+    }
+    uart_cli_send("# SNAPSHOT end\r\n");
+
+    if (!was_halted) swd_resume();
+}
+
+// ---------------------------------------------------------------------------
+// SWD LEAKPROBE <addr> — rigorous flash-read-leak probe. Does a MEM-AP read of a
+// (possibly RDP-blocked) address and captures the raw data phase, RDBUFF, and
+// sticky-error state ATOMICALLY, with NO swd_clear_errors() in between, so the
+// per-command auto-clear cannot wipe any transient residue. Baselines with a
+// known SRAM read first, so a leak (flash data appearing in the captured values)
+// is distinguishable from stale pipeline data. See RDP1_DEBUG_MATRIX.md.
+// ---------------------------------------------------------------------------
+void swd_leakprobe(uint32_t addr) {
+    if (!swd_init_ahb_ap()) { uart_cli_send("ERROR: AHB-AP init failed\r\n"); return; }
+
+    // Baseline: a known SRAM word flows through the AP read pipeline into RDBUFF.
+    uint32_t base = 0xA5A5A5A5;
+    swd_read_mem(0x20000000, &base, 1);
+    uart_cli_printf("LEAKPROBE 0x%08lX (baseline SRAM[0x20000000]=0x%08lX)\r\n",
+                    (unsigned long)addr, (unsigned long)base);
+
+    // Point the MEM-AP at the target and post a DRW read, capturing the raw data
+    // phase regardless of ACK — this is where flash data would appear if latched.
+    swd_write_ap(0, AP_TAR, addr);
+    swd_select_ap(0, AP_DRW);
+    uint8_t req = make_request(true, true, AP_DRW & 0xC);
+    swd_seq_out(req, 8);
+    uint8_t ack = swd_seq_in(3);
+    uint32_t drw_raw = 0;
+    bool par = swd_seq_in_parity(&drw_raw);
+    swd_seq_out(0, 8);                       // trailing idle + turnaround to drive
+    uart_cli_printf("  DRW ack=%u (1=OK 2=WAIT 4=FAULT) rawdata=0x%08lX parity_ok=%d\r\n",
+                    ack, (unsigned long)drw_raw, par);
+
+    // RDBUFF + sticky flags, still WITHOUT clearing.
+    uint32_t rdbuff = 0, stat = 0;
+    swd_read_dp(DP_RDBUFF, &rdbuff);
+    swd_read_dp(DP_CTRL_STAT, &stat);
+    uart_cli_printf("  RDBUFF=0x%08lX  CTRL/STAT=0x%08lX STICKYERR=%lu\r\n",
+                    (unsigned long)rdbuff, (unsigned long)stat,
+                    (unsigned long)((stat >> 5) & 1));
+
+    // Verdict hint.
+    if (drw_raw != base && drw_raw != 0xFFFFFFFF && drw_raw != 0x00000000)
+        uart_cli_printf("  *** DRW rawdata is neither baseline nor idle — inspect for leak ***\r\n");
+    else
+        uart_cli_send("  DRW rawdata = baseline/idle (no obvious leak)\r\n");
+
+    swd_clear_errors();     // safe to recover now
+    uart_cli_send("LEAKPROBE done\r\n");
 }

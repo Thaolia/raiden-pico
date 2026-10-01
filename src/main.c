@@ -17,25 +17,23 @@ extern void chipshot_uart_process(void);
 extern void target_uart_process(void);
 extern void target_init(void);
 
-// LED d'etat.
-//
-// ATTENTION : sur Pico 2 W, GP25 n'est PAS la LED, c'est le chip-select du
-// bus SPI vers le module Wi-Fi. Le piloter en GPIO tue la liaison CYW43 --
-// et comme pico2_w.h ne definit deliberement aucun PICO_DEFAULT_LED_PIN
-// ("LED is on Wireless chip"), un `#define LED_PIN 25` en dur compilerait
-// sans le moindre avertissement. La LED passe donc par le module Wi-Fi, ce
-// qui impose que cyw43_arch_init() ait deja reussi avant tout allumage.
-#if defined(CYW43_WL_GPIO_LED_PIN)
-  #define RAIDEN_LED_INIT()  ((void)0)
-  #define RAIDEN_LED_SET(v)  cyw43_arch_gpio_put(CYW43_WL_GPIO_LED_PIN, (v))
-#elif defined(PICO_DEFAULT_LED_PIN)
-  #define RAIDEN_LED_INIT()  do { gpio_init(PICO_DEFAULT_LED_PIN);          \
-                                  gpio_set_dir(PICO_DEFAULT_LED_PIN,        \
-                                               GPIO_OUT); } while (0)
-  #define RAIDEN_LED_SET(v)  gpio_put(PICO_DEFAULT_LED_PIN, (v))
+// Board-aware status LED.
+// On the base Pico 2 (and XXL) the SDK board header defines PICO_DEFAULT_LED_PIN
+// (GP25 on Pico 2) and we drive it directly. On the Pico 2 W the onboard LED
+// hangs off the CYW43 wireless chip, so PICO_DEFAULT_LED_PIN is undefined there;
+// we no-op instead of driving GP25, which on the W is the CYW43 SPI chip-select
+// (WL_CS). This keeps the LED working on Pico 2 / XXL without pulling in the
+// wireless stack, and avoids a pin conflict on the Pico 2 W.
+#ifdef PICO_DEFAULT_LED_PIN
+static inline void status_led_init(void) {
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, 1);  // Turn on LED
+}
+static inline void status_led_set(bool on) { gpio_put(PICO_DEFAULT_LED_PIN, on); }
 #else
-  #define RAIDEN_LED_INIT()  ((void)0)
-  #define RAIDEN_LED_SET(v)  ((void)(v))
+static inline void status_led_init(void) { }        // Pico 2 W: LED is on CYW43, no GPIO
+static inline void status_led_set(bool on) { (void)on; }
 #endif
 
 int main() {
@@ -49,17 +47,17 @@ int main() {
     printf("Raiden Pico starting...\n");
 
     // Reserver les ressources PIO cablees en dur AVANT toute initialisation
-    // qui pourrait en allouer (cyw43_arch_init au premier chef). Voir
-    // src/pio_alloc.c : sans cela le pilote Wi-Fi vole sa state machine a
-    // swd_phy, et rien ne le signale jusqu'a la premiere commande SWD.
+    // susceptible d'en allouer. Precharge aussi les programmes swd_phy, pour
+    // sortir pio_add_program du chemin chronometre de SWD RACE. Voir
+    // src/pio_alloc.c.
     pio_resources_reserve();
 
-    // Wi-Fi (Pico 2 W) : apres la reservation PIO, et AVANT le premier
-    // allumage de LED -- sur cette carte la LED passe par le module Wi-Fi.
+    // Abstraction de sortie CLI : no-op hors Wi-Fi (backend TCP non compile,
+    // RAIDEN_HAS_WIFI jamais defini sur les cibles actuelles).
     net_cli_init();
 
-    RAIDEN_LED_INIT();
-    RAIDEN_LED_SET(1);
+    // Initialize LED (board-aware; no-op on Pico 2 W)
+    status_led_init();
 
     printf("LED initialized\n");
 
@@ -89,9 +87,9 @@ int main() {
 
     // Blink LED to indicate ready
     for (int i = 0; i < 3; i++) {
-        RAIDEN_LED_SET(0);
+        status_led_set(false);
         sleep_ms(100);
-        RAIDEN_LED_SET(1);
+        status_led_set(true);
         sleep_ms(100);
     }
 

@@ -139,12 +139,20 @@ bool target_bat32_glitch_pio_sweep(uint32_t p_start, uint32_t p_end, uint32_t p_
 // per attempt so a host sweep can parse per-shot results.
 void target_power_lpc_glitch(uint32_t count);
 void target_power_payload(float voltage, uint32_t max_attempts);
-void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes);
+void target_power_bypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv);
 void target_power_halt(uint32_t dump_bytes);
+void target_power_cleanwake(void);
+void target_power_shadowchar(uint32_t iterations);
 void target_power_literal(void);
 void target_power_regdump(void);
 void target_power_glitch_regdump(uint32_t max_attempts);
 void target_power_resettest(void);
+
+// Ensure UART1 is routed to the target pins (GP4/5), re-claiming it from GRBL
+// (GP8/9) if GRBL currently owns it. Called by the target TX/bootloader paths so
+// a TARGET SEND / BL command after a GRBL command auto-switches instead of
+// bleeding onto the GRBL controller.
+void target_uart_ensure_active(void);
 
 // STM32 USART bootloader commands (AN3155)
 void stm32_bl_get(void);

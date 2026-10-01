@@ -90,8 +90,12 @@ class TestSystemInfo:
 
     def test_pins_output(self, raiden):
         r = raiden.cmd("PINS", wait=2)
-        for pin in ["GP2", "GP7", "GP15", "GP17", "GP18", "GP25"]:
+        for pin in ["GP2", "GP7", "GP15", "GP17", "GP18"]:
             assert pin in r, f"PINS missing: {pin}"
+        # Status LED is board-aware: GP25 on Pico 2, on the CYW43 (no GPIO) on
+        # a Pico 2 W build.
+        assert "GP25" in r or "CYW43" in r or "wireless" in r.lower(), \
+            "PINS missing status-LED line"
         assert "Glitch Output (normal)" in r
         assert "Glitch Output (inverted)" in r
 
@@ -263,6 +267,33 @@ class TestDebug:
         r = raiden.cmd("DEBUG")
         assert "OFF" in r
 
+    def test_swd_scan_recognized(self, raiden):
+        """SWD SCAN must be a recognised sub-command (registered in the matcher).
+        With a target wired it enumerates the DAP; with none it errors on connect
+        — either way it must not be rejected as an unknown sub-command."""
+        r = raiden.cmd("SWD SCAN", wait=3)
+        assert "Unknown SWD" not in r
+        assert ("SCAN complete" in r or "Access Ports" in r or
+                "connection failed" in r or "DPIDR" in r)
+
+    def test_swd_snapshot_bad_arg_errors(self, raiden):
+        """SWD SNAPSHOT rejects a bad sram_addr. (SWD auto-connect runs first, so a
+        target-less setup sees a connect error instead — both are errors.)"""
+        r = raiden.cmd("SWD SNAPSHOT notanumber", wait=2)
+        assert "ERROR" in r and ("sram_addr" in r or "onnection" in r)
+
+    def test_swd_snapshot_recognized(self, raiden):
+        """SWD SNAPSHOT must be a recognised sub-command."""
+        r = raiden.cmd("SWD SNAPSHOT", wait=3)
+        assert "Unknown SWD" not in r
+        assert ("SNAPSHOT" in r or "REG." in r or "connection failed" in r or "DPIDR" in r)
+
+    def test_swd_leakprobe_usage_errors(self, raiden):
+        """SWD LEAKPROBE needs an address. (SWD auto-connect runs first, so a
+        target-less setup errors on connect instead — both are errors.)"""
+        r = raiden.cmd("SWD LEAKPROBE", wait=2)
+        assert "ERROR" in r and ("LEAKPROBE" in r or "onnection" in r)
+
 
 # ── Target type ──────────────────────────────────────────────
 
@@ -331,6 +362,111 @@ class TestTargetType:
         assert "ERROR" in raiden.cmd("SWD RDP", wait=2)
         assert "ERROR" in raiden.cmd("SWD FLASH ERASE 0", wait=2)
         raiden.cmd("TARGET STM32F1")  # restore a benign default
+
+
+# ── UART1 switching (Target <-> GRBL bleed regression) ───────
+#
+# UART1 is shared between the Target (GP4/5) and GRBL (GP8/9). Regression for the
+# TTL bleed where a TARGET command after a GRBL command wrote to UART1 while it
+# was still routed to GP8/9 (bleeding bootloader traffic onto the GRBL
+# controller). The fix makes target TX auto-reclaim UART1 from GRBL. No target
+# or GRBL controller is attached — this only observes the pin-routing handover.
+
+class TestUartSwitching:
+
+    def test_target_send_reclaims_uart_from_grbl(self, raiden):
+        raiden.cmd("GRBL POS", wait=3)     # inits GRBL UART on GP8/9 (grbl active)
+        raiden.cmd("TARGET STM32F1")       # valid target so SEND is accepted
+        r = raiden.cmd("TARGET SEND 7F", wait=2)
+        assert "reclaimed from GRBL" in r  # auto-switched back to GP4/5
+        assert "ERROR" not in r
+
+    def test_grbl_still_works_after_target(self, raiden):
+        """The reverse direction stays clean: a GRBL command after a target
+        command re-inits the GRBL UART (grbl_init deinits GP4/5)."""
+        raiden.cmd("TARGET SEND 7F", wait=1)   # target owns UART1
+        r = raiden.cmd("GRBL POS", wait=3)      # must re-init GRBL on GP8/9
+        assert "Grbl UART initialized" in r or "GP8" in r
+
+
+# ── BYPASS per-family payload selection (error path only) ────
+#
+# Only the unsupported-family ERROR path is exercised here: it returns from the
+# family gate BEFORE the sweep/POR glitch, so it drives no hardware and is safe
+# under config_none. The F1/F4 happy path fires the power glitch and needs a
+# wired target — that's power-int gated bench validation, not here.
+
+class TestBypassPayloadFamily:
+
+    def test_bypass_unsupported_family_errors(self, raiden):
+        """A family with no ported BYPASS payload (e.g. STM32L4) must error at
+        the family gate, before any sweep or glitch."""
+        raiden.cmd("TARGET POWER INT")   # ensure not EXTERNAL (default anyway)
+        raiden.cmd("TARGET STM32L4")
+        r = raiden.cmd("TARGET GLITCH BYPASS", wait=3)
+        assert "ERROR" in r
+        assert "No BYPASS payload" in r
+        assert "STM32F1" in r and "STM32F4" in r  # names the supported families
+
+    def test_bypass_bad_voltage_errors(self, raiden):
+        """The optional [voltage_mv] arg must reject non-numeric / out-of-range
+        input at parse time, before any hardware access."""
+        r = raiden.cmd("TARGET GLITCH BYPASS 5 0 notanumber", wait=1)
+        assert "ERROR" in r and "voltage_mv" in r
+        r = raiden.cmd("TARGET GLITCH BYPASS 5 0 9999", wait=1)  # > 3300 mV
+        assert "ERROR" in r and "voltage_mv" in r
+
+    def test_shadowbypass_bad_voltage_errors(self, raiden):
+        """SHADOWBYPASS shares the same [voltage_mv] parse/range guard."""
+        r = raiden.cmd("TARGET GLITCH SHADOWBYPASS 1 64 notanumber", wait=1)
+        assert "ERROR" in r and "voltage_mv" in r
+        r = raiden.cmd("TARGET GLITCH SHADOWBYPASS 1 64 9999", wait=1)  # > 3300 mV
+        assert "ERROR" in r and "voltage_mv" in r
+
+
+# ── External PSU command (error/parse paths only) ────────────
+#
+# These stay on the safe paths that return BEFORE the PSU UART claims GP10/11:
+# unknown sub-command, missing/out-of-range args, and the power-ON exclusion
+# (which refuses before retasking any pin). Actual PSU comms need the wired
+# TENMA + MAX3232 and are bench-tested.
+
+class TestPsu:
+
+    def test_psu_usage_no_arg(self, raiden):
+        r = raiden.cmd("PSU")
+        assert "PSU" in r and ("VOLT" in r or "Usage" in r)
+        assert "ERROR" not in r  # bare PSU prints usage/state, not an error
+
+    def test_psu_unknown_subcommand_errors(self, raiden):
+        r = raiden.cmd("PSU FOOBAR")
+        assert "ERROR" in r
+
+    def test_psu_volt_missing_arg_errors(self, raiden):
+        r = raiden.cmd("PSU VOLT")
+        assert "ERROR" in r
+
+    def test_psu_volt_out_of_range_errors(self, raiden):
+        r = raiden.cmd("PSU VOLT 99999")
+        assert "ERROR" in r
+        assert "range" in r.lower()
+
+    def test_psu_curr_out_of_range_errors(self, raiden):
+        r = raiden.cmd("PSU CURR 99999")
+        assert "ERROR" in r
+        assert "range" in r.lower()
+
+    def test_psu_refused_while_target_power_on(self, raiden):
+        """With the target power group ON, a PSU command must refuse (shared
+        GP10/11) before retasking any pin."""
+        raiden.cmd("TARGET POWER INT")
+        raiden.cmd("TARGET POWER ON")
+        try:
+            r = raiden.cmd("PSU ID", wait=1)
+            assert "ERROR" in r
+            assert "power is ON" in r or "TARGET POWER OFF" in r
+        finally:
+            raiden.cmd("TARGET POWER OFF")
 
 
 # ── Glitch execution ─────────────────────────────────────────

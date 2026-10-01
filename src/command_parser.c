@@ -301,9 +301,9 @@ void command_parser_execute(cmd_parts_t *parts) {
         "SET", "GET", "TRIGGER", "PINS",
         "STATUS", "RESET", "CS", "TARGET", "ARM", "GLITCH",
         "HELP", "REBOOT", "DEBUG", "API", "ERROR", "SWD", "JTAG",
-        "TRACE", "VERSION", "CLOCK", "GRBL", "ADC"
+        "TRACE", "VERSION", "CLOCK", "GRBL", "ADC", "PSU"
     };
-    if (!match_and_replace(&parts->parts[0], primary_commands, 22, "command")) {
+    if (!match_and_replace(&parts->parts[0], primary_commands, 23, "command")) {
         goto api_response;
     }
 
@@ -322,14 +322,19 @@ void command_parser_execute(cmd_parts_t *parts) {
             }
         } else if (strcmp(parts->parts[0], "SWD") == 0) {
             const char *swd_subcmds[] = {"CONNECT", "CONNECTRST", "DISCONNECT", "READ", "WRITE", "FILL", "IDCODE",
-                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED", "RACE",
-                                          "PHY", "BENCH", "BAT32", "GLITCH"};
-            if (!match_and_replace(&parts->parts[1], swd_subcmds, 22, "SWD sub-command")) {
+                                          "HALT", "RESUME", "REGS", "SETREG", "RDP", "OPT", "FLASH", "RESET", "BPTEST", "SPEED",
+                                          "SCAN", "SNAPSHOT", "LEAKPROBE", "RACE", "PHY", "BENCH", "BAT32", "GLITCH"};
+            if (!match_and_replace(&parts->parts[1], swd_subcmds, 25, "SWD sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "JTAG") == 0) {
             const char *jtag_subcmds[] = {"RESET", "TEST", "IDCODE", "SCAN", "IR", "DR"};
             if (!match_and_replace(&parts->parts[1], jtag_subcmds, 6, "JTAG sub-command")) {
+                goto api_response;
+            }
+        } else if (strcmp(parts->parts[0], "PSU") == 0) {
+            const char *psu_subcmds[] = {"VOLT", "CURR", "ON", "OFF", "STATUS", "ID", "RELEASE"};
+            if (!match_and_replace(&parts->parts[1], psu_subcmds, 7, "PSU sub-command")) {
                 goto api_response;
             }
         } else if (strcmp(parts->parts[0], "TRACE") == 0 && parts->count >= 2) {
@@ -436,8 +441,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("TARGET GLITCH TEST <V> [count]  - Basic power glitch test\r\n");
         uart_cli_send("TARGET GLITCH SWEEP              - Voltage sweep (SRAM retention, ADC on GP26)\r\n");
         uart_cli_send("TARGET GLITCH PAYLOAD [V] [n]    - Glitch with SRAM payload\r\n");
-        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] - RDP1 bypass + flash dump [STM32F1]\r\n");
+        uart_cli_send("TARGET GLITCH BYPASS [attempts] [bytes] [voltage_mv] - RDP1 POR-glitch + flash dump; voltage_mv skips SWEEP [STM32F1/F4]\r\n");
+        uart_cli_send("TARGET GLITCH SHADOWBYPASS [attempts] [bytes] [voltage_mv] - RDP1 shadow-load glitch; voltage_mv = ADC-gated dip depth [STM32]\r\n");
         uart_cli_send("TARGET GLITCH HALT [bytes]       - RDP1 flash dump via SWD+FPB (no glitch)\r\n");
+        uart_cli_send("TARGET GLITCH CLEANWAKE          - Control: SRAM-boot + STOP/wake, no debug, try flash read\r\n");
+        uart_cli_send("TARGET GLITCH SHADOWCHAR [n]     - Characterize POR power-up window (t_vdd..t_nrst) for shadow-load glitch\r\n");
         uart_cli_send("TARGET GLITCH LITERAL             - Literal payload test\r\n");
         uart_cli_send("TARGET GLITCH REGDUMP             - Register dump payload\r\n");
         uart_cli_send("TARGET GLITCH GLITCH_REGDUMP [n]  - Glitch + register dump\r\n");
@@ -486,6 +494,16 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("  Usage: TRIGGER UART 79 → TRACE 4096 50 → ARM TRACE → (trigger event)\r\n");
         uart_cli_send("         TRACE STATUS → TRACE DUMP → ARM OFF\r\n");
         uart_cli_send("\r\n");
+        uart_cli_send("== External PSU (TENMA 72-2540 / Korad) ==\r\n");
+        uart_cli_send("PSU VOLT <mV>          - Set output voltage (0-30000 mV)\r\n");
+        uart_cli_send("PSU CURR <mA>          - Set current limit (0-5000 mA)\r\n");
+        uart_cli_send("PSU ON | OFF           - Enable / disable output\r\n");
+        uart_cli_send("PSU STATUS             - Read Vout/Iout + CV/CC + output state\r\n");
+        uart_cli_send("PSU ID                 - Identify the PSU (connectivity check)\r\n");
+        uart_cli_send("PSU RELEASE            - Return GP10/11 to the target power group\r\n");
+        uart_cli_send("  UART1 on GP10/GP11 @ 9600 8N1 (needs a MAX3232 on the DB9).\r\n");
+        uart_cli_send("  Mutually exclusive with TARGET POWER (shares GP10/11).\r\n");
+        uart_cli_send("\r\n");
         uart_cli_send("== XY Platform (Grbl) ==\r\n");
         uart_cli_send("GRBL SEND <gcode>      - Send raw G-code command\r\n");
         uart_cli_send("GRBL UNLOCK            - Unlock alarm (enable movement without homing)\r\n");
@@ -532,7 +550,7 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("\r\n");
 
     } else if (strcmp(parts->parts[0], "VERSION") == 0) {
-        uart_cli_send("Raiden Pico Glitcher v0.7-JLQ_26/09/30-v7\r\n");
+        uart_cli_send("Raiden Pico Glitcher v0.13-JLQ_26/10/01-v8\r\n");
         // Quel lien porte cette CLI : c'est la seule facon de savoir, depuis
         // l'hote, quelle variante de binaire est reellement sur la puce.
 #if RAIDEN_CONSOLE_UART
@@ -1003,6 +1021,7 @@ void command_parser_execute(cmd_parts_t *parts) {
             uart_cli_send("GP12 - Target Power (ganged, default ON, 12mA drive)\r\n");
         }
         uart_cli_send("       (GP10/11/12 mode: TARGET POWER [INT|EXT])\r\n");
+        uart_cli_send("       (or GP10/11 = external PSU UART1 via PSU cmds — needs MAX3232)\r\n");
         uart_cli_send("GP15 - Target Reset (default HIGH, LOW 300ms pulse)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("GP13 - BOOT0 Control\r\n");
@@ -1020,7 +1039,11 @@ void command_parser_execute(cmd_parts_t *parts) {
         uart_cli_send("GP21 - RTCK (JTAG adaptive clocking, optional)\r\n");
         uart_cli_send("\r\n");
         uart_cli_send("== Status ==\r\n");
-        uart_cli_send("GP25 - Status LED\r\n");
+#ifdef PICO_DEFAULT_LED_PIN
+        uart_cli_printf("GP%u - Status LED\r\n", PICO_DEFAULT_LED_PIN);
+#else
+        uart_cli_send("Status LED - on CYW43 wireless chip (Pico 2 W), no GPIO\r\n");
+#endif
         uart_cli_send("\r\n");
         uart_cli_send("== External Reset (suggested) ==\r\n");
         uart_cli_send("EN   - Tie to FTDI DTR (on /dev/ttyUSB0) for host-driven reset.\r\n");
@@ -1337,6 +1360,11 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send(msg);
             }
         } else if (strcmp(parts->parts[1], "POWER") == 0) {
+            extern bool psu_is_active(void);
+            if (parts->count >= 3 && psu_is_active()) {
+                api_error("ERROR: GP10/11 held by the PSU UART — run PSU RELEASE before using TARGET POWER\r\n");
+                goto api_response;
+            }
             if (parts->count < 3) {
                 // Query: power on/off state + current group mode / crowbar polarity
                 bool power_state = target_power_get_state();
@@ -1687,7 +1715,7 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("  TEST <voltage> [count]     - Basic power glitch test\r\n");
                 uart_cli_send("  SWEEP                      - Voltage sweep\r\n");
                 uart_cli_send("  PAYLOAD [voltage] [attempts] - Glitch with SRAM payload\r\n");
-                uart_cli_send("  BYPASS [attempts] [dump_bytes] - STM32 RDP bypass + flash dump\r\n");
+                uart_cli_send("  BYPASS [attempts] [dump_bytes] [voltage_mv] - STM32 RDP bypass + flash dump\r\n");
                 uart_cli_send("  LPCBYPASS [count]              - LPC CRP-bypass; depth=VMIN, dwell=WIDTH\r\n");
                 uart_cli_send("  HALT [dump_bytes]          - Halt-based flash dump\r\n");
                 uart_cli_send("  LITERAL                    - Literal payload test\r\n");
@@ -1698,8 +1726,8 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uart_cli_send("                             - Measure cycle count to breakpoint (DWT+ADC)\r\n");
                 uart_cli_send("  (BAT32: only TEST/SWEEP -- power-group dip + flash/SRAM oracle)\r\n");
             } else {
-                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "LPCBYPASS",
-                                             "HALT", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
+                const char *glitch_cmds[] = {"TEST", "SWEEP", "PAYLOAD", "BYPASS", "SHADOWBYPASS", "SHADOWSCAN", "LPCBYPASS",
+                                             "HALT", "CLEANWAKE", "SHADOWCHAR", "LITERAL", "REGDUMP", "GLITCH_REGDUMP", "RESETTEST", "TIMING"};
                 if (!match_and_replace(&parts->parts[2], glitch_cmds, 11, "GLITCH command")) {
                     goto api_response;
                 }
@@ -1767,21 +1795,71 @@ void command_parser_execute(cmd_parts_t *parts) {
                 } else if (strcmp(parts->parts[2], "BYPASS") == 0) {
                     uint32_t attempts = 20;
                     uint32_t dump_bytes = 0;
+                    uint32_t glitch_mv = 0;
                     if (parts->count >= 4) {
                         if (!parse_u32(parts->parts[3], 0, &attempts)) {
-                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes]\r\n");
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
                             goto api_response;
                         }
                     }
                     if (parts->count >= 5) {
                         if (!parse_u32(parts->parts[4], 0, &dump_bytes)) {
-                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes]\r\n");
+                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (parts->count >= 6) {
+                        if (!parse_u32(parts->parts[5], 0, &glitch_mv) || glitch_mv > 3300) {
+                            api_error("ERROR: Invalid voltage_mv (0-3300). Usage: TARGET GLITCH BYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
                             goto api_response;
                         }
                     }
                     if (attempts < 1) attempts = 1;
                     if (attempts > 100) attempts = 100;
-                    target_power_bypass(attempts, dump_bytes);
+                    target_power_bypass(attempts, dump_bytes, glitch_mv);
+                } else if (strcmp(parts->parts[2], "SHADOWBYPASS") == 0) {
+                    // RDP1 shadow-load glitch bypass: sweep a timed voltage dip
+                    // during POR recovery to corrupt the RDP option-byte shadow,
+                    // then read via the FPB chain. Usage: [attempts] [dump_bytes]
+                    extern void target_power_shadowbypass(uint32_t max_attempts, uint32_t dump_bytes, uint32_t glitch_mv);
+                    uint32_t attempts = 2000;
+                    uint32_t dump_bytes = 64;
+                    uint32_t glitch_mv = 0;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &attempts)) {
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (parts->count >= 5) {
+                        if (!parse_u32(parts->parts[4], 0, &dump_bytes)) {
+                            api_error("ERROR: Invalid dump_bytes. Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (parts->count >= 6) {
+                        if (!parse_u32(parts->parts[5], 0, &glitch_mv) || glitch_mv > 3300) {
+                            api_error("ERROR: Invalid voltage_mv (0-3300). Usage: TARGET GLITCH SHADOWBYPASS [attempts] [dump_bytes] [voltage_mv]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (attempts < 1) attempts = 1;
+                    if (attempts > 200000) attempts = 200000;
+                    target_power_shadowbypass(attempts, dump_bytes, glitch_mv);
+                } else if (strcmp(parts->parts[2], "SHADOWSCAN") == 0) {
+                    // FAST timing pre-screen: glitch POR + dip, then SWD-read
+                    // FLASH_OPTCR and log any change from baseline. Usage: [attempts]
+                    extern void target_power_shadowscan(uint32_t max_attempts);
+                    uint32_t attempts = 5000;
+                    if (parts->count >= 4) {
+                        if (!parse_u32(parts->parts[3], 0, &attempts)) {
+                            api_error("ERROR: Invalid attempts. Usage: TARGET GLITCH SHADOWSCAN [attempts]\r\n");
+                            goto api_response;
+                        }
+                    }
+                    if (attempts < 1) attempts = 1;
+                    if (attempts > 500000) attempts = 500000;
+                    target_power_shadowscan(attempts);
                 } else if (strcmp(parts->parts[2], "LPCBYPASS") == 0) {
                     // ADC-controlled voltage glitch against a CRP-locked LPC.
                     // Reads depth (VMIN) and dwell (WIDTH) from glitch config —
@@ -1806,6 +1884,15 @@ void command_parser_execute(cmd_parts_t *parts) {
                         }
                     }
                     target_power_halt(dump_bytes);
+                } else if (strcmp(parts->parts[2], "CLEANWAKE") == 0) {
+                    target_power_cleanwake();
+                } else if (strcmp(parts->parts[2], "SHADOWCHAR") == 0) {
+                    uint32_t iters = 0;
+                    if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &iters)) {
+                        api_error("ERROR: Invalid count. Usage: TARGET GLITCH SHADOWCHAR [iterations]\r\n");
+                        goto api_response;
+                    }
+                    target_power_shadowchar(iters);
                 } else if (strcmp(parts->parts[2], "LITERAL") == 0) {
                     target_power_literal();
                 } else if (strcmp(parts->parts[2], "REGDUMP") == 0) {
@@ -2313,6 +2400,32 @@ void command_parser_execute(cmd_parts_t *parts) {
         } else if (strcmp(parts->parts[1], "DISCONNECT") == 0) {
             swd_deinit();
             uart_cli_send("OK: SWD disconnected (pins high-Z)\r\n");
+
+        } else if (strcmp(parts->parts[1], "SCAN") == 0) {
+            // Enumerate the DAP (APs + CoreSight ROM table). Auto-connect already
+            // ran above. SWD-only — no JTAG needed.
+            swd_scan();
+
+        } else if (strcmp(parts->parts[1], "SNAPSHOT") == 0) {
+            // Diffable capture of non-flash state (regs + peripherals + SRAM).
+            uint32_t sram_addr = 0x20000000, sram_len = 256;
+            if (parts->count >= 3 && !parse_u32(parts->parts[2], 0, &sram_addr)) {
+                api_error("ERROR: Invalid sram_addr. Usage: SWD SNAPSHOT [sram_addr] [sram_len]\r\n");
+                goto api_response;
+            }
+            if (parts->count >= 4 && !parse_u32(parts->parts[3], 0, &sram_len)) {
+                api_error("ERROR: Invalid sram_len. Usage: SWD SNAPSHOT [sram_addr] [sram_len]\r\n");
+                goto api_response;
+            }
+            swd_snapshot(sram_addr, sram_len);
+
+        } else if (strcmp(parts->parts[1], "LEAKPROBE") == 0) {
+            uint32_t addr = 0;
+            if (parts->count < 3 || !parse_u32(parts->parts[2], 0, &addr)) {
+                api_error("ERROR: Usage: SWD LEAKPROBE <addr>\r\n");
+                goto api_response;
+            }
+            swd_leakprobe(addr);
 
         } else if (strcmp(parts->parts[1], "SPEED") == 0) {
             if (parts->count >= 3) {
@@ -3633,7 +3746,10 @@ void command_parser_execute(cmd_parts_t *parts) {
                 uint32_t cur_addr = addr;
                 while (remaining > 0) {
                     uint32_t chunk = remaining;
-                    if (chunk > info->page_size) chunk = info->page_size;
+                    // Cap at the page_buf size, NOT page_size — on F4 page_size is
+                    // 16 KB (sector) but page_buf is 2 KB, so chunking by page_size
+                    // would over-read the buffer.
+                    if (chunk > sizeof(page_buf)) chunk = sizeof(page_buf);
                     uint32_t w = swd_stm32_flash_write(info, cur_addr, page_buf, chunk);
                     written_total += w;
                     if (w < chunk) {
@@ -4408,6 +4524,70 @@ void command_parser_execute(cmd_parts_t *parts) {
             if (i < parts->count) parse_u32(parts->parts[i++], 0, &samp);
             if (i < parts->count) parse_u32(parts->parts[i++], 0, &pre);
             trace_start(samp, pre);
+        }
+
+    } else if (strcmp(parts->parts[0], "PSU") == 0) {
+        extern void psu_release(void);
+        extern bool psu_is_active(void);
+        extern bool psu_set_voltage_mv(uint32_t mv);
+        extern bool psu_set_current_ma(uint32_t ma);
+        extern bool psu_output(bool on);
+        extern int  psu_id(char *buf, size_t buflen);
+        extern int  psu_read_voltage(char *buf, size_t buflen);
+        extern int  psu_read_current(char *buf, size_t buflen);
+        extern bool psu_read_status(uint8_t *status_out);
+
+        if (parts->count < 2) {
+            uart_cli_send("Usage: PSU <VOLT <mV>|CURR <mA>|ON|OFF|STATUS|ID|RELEASE>\r\n");
+            uart_cli_printf("  UART1 on GP%d/GP%d @ %d 8N1 (TENMA 72-2540 / Korad); needs a MAX3232 on the DB9\r\n",
+                            PSU_UART_TX_PIN, PSU_UART_RX_PIN, PSU_UART_BAUD);
+            uart_cli_printf("  Active: %s\r\n", psu_is_active() ? "yes (power group released)" : "no");
+        } else if (strcmp(parts->parts[1], "VOLT") == 0) {
+            if (parts->count < 3) { api_error("ERROR: Usage: PSU VOLT <millivolts>\r\n"); goto api_response; }
+            uint32_t mv;
+            if (!parse_u32(parts->parts[2], 10, &mv)) { api_error("ERROR: Invalid voltage (millivolts)\r\n"); goto api_response; }
+            if (mv > 30000) { api_error("ERROR: Voltage out of range (0-30000 mV)\r\n"); goto api_response; }
+            if (psu_set_voltage_mv(mv))
+                uart_cli_printf("OK: PSU VSET %lu.%02lu V\r\n", (unsigned long)(mv/1000), (unsigned long)((mv%1000)/10));
+        } else if (strcmp(parts->parts[1], "CURR") == 0) {
+            if (parts->count < 3) { api_error("ERROR: Usage: PSU CURR <milliamps>\r\n"); goto api_response; }
+            uint32_t ma;
+            if (!parse_u32(parts->parts[2], 10, &ma)) { api_error("ERROR: Invalid current (milliamps)\r\n"); goto api_response; }
+            if (ma > 5000) { api_error("ERROR: Current out of range (0-5000 mA)\r\n"); goto api_response; }
+            if (psu_set_current_ma(ma))
+                uart_cli_printf("OK: PSU ISET %lu.%03lu A\r\n", (unsigned long)(ma/1000), (unsigned long)(ma%1000));
+        } else if (strcmp(parts->parts[1], "ON") == 0) {
+            if (psu_output(true)) uart_cli_send("OK: PSU output ON\r\n");
+        } else if (strcmp(parts->parts[1], "OFF") == 0) {
+            if (psu_output(false)) uart_cli_send("OK: PSU output OFF\r\n");
+        } else if (strcmp(parts->parts[1], "ID") == 0) {
+            char buf[64];
+            int n = psu_id(buf, sizeof(buf));
+            if (n > 0) uart_cli_printf("PSU ID: %s\r\n", buf);
+            else if (psu_is_active()) uart_cli_send("ERROR: no response from PSU (check wiring / MAX3232 / baud)\r\n");
+        } else if (strcmp(parts->parts[1], "STATUS") == 0) {
+            char v[16], i[16]; uint8_t st = 0;
+            int nv = psu_read_voltage(v, sizeof(v));
+            int ni = psu_read_current(i, sizeof(i));
+            bool sok = psu_read_status(&st);
+            if (nv <= 0 && ni <= 0 && !sok) {
+                if (psu_is_active()) uart_cli_send("ERROR: no response from PSU (check wiring / MAX3232 / baud)\r\n");
+            } else {
+                uart_cli_printf("PSU Vout: %s  Iout: %s\r\n", nv > 0 ? v : "?", ni > 0 ? i : "?");
+                if (sok) {
+                    // STATUS byte, verified on a TENMA 72-2540 V5.9:
+                    // bit0 = CH1 CV(1)/CC(0), bit4 = beep, bit5 = lock, bit6 = output on
+                    bool out_on = st & 0x40;
+                    uart_cli_printf("PSU output: %s  mode: %s  beep: %s%s  (STATUS 0x%02X)\r\n",
+                                    out_on ? "ON" : "OFF",
+                                    out_on ? ((st & 0x01) ? "CV" : "CC") : "-",
+                                    (st & 0x10) ? "on" : "off",
+                                    (st & 0x20) ? "  [LOCKED]" : "",
+                                    st);
+                }
+            }
+        } else if (strcmp(parts->parts[1], "RELEASE") == 0) {
+            psu_release();
         }
 
     } else {

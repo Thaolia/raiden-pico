@@ -1,14 +1,16 @@
 cmake_minimum_required(VERSION 3.13)
 
-# Board variant selection: BOARD=pico2 (default) or BOARD=xxl (Olimex RP2350-XXL)
-set(BOARD "pico2" CACHE STRING "Board variant: pico2, pico2w or xxl")
+# Board variant selection: BOARD=pico2 (default), pico2_w (Pico 2 W), or xxl (Olimex RP2350-XXL)
+set(BOARD "pico2" CACHE STRING "Board variant: pico2, pico2_w or xxl")
 if(BOARD STREQUAL "xxl")
     set(PICO_BOARD olimex_rp2350_xxl CACHE STRING "Board type" FORCE)
     set(BOARD_NAME "Olimex RP2350-XXL")
-elseif(BOARD STREQUAL "pico2w")
+elseif(BOARD STREQUAL "pico2_w")
+    # Pico 2 W: onboard LED is on the CYW43 wireless chip (PICO_DEFAULT_LED_PIN
+    # is undefined), so the firmware's status LED no-ops rather than driving
+    # GP25 (= CYW43 WL_CS on this board). No wireless stack is pulled in.
     set(PICO_BOARD pico2_w CACHE STRING "Board type" FORCE)
     set(BOARD_NAME "Raspberry Pi Pico 2 W")
-    set(RAIDEN_HAS_WIFI ON)
 else()
     set(PICO_BOARD pico2 CACHE STRING "Board type" FORCE)
     set(BOARD_NAME "Raspberry Pi Pico 2")
@@ -61,6 +63,7 @@ add_executable(raiden_pico
     src/stm32_breakpoints.c
     src/lpc_target.c
     src/bat32_target.c
+    src/psu.c
 )
 
 # Include directories
@@ -118,6 +121,14 @@ if(RAIDEN_CONSOLE_UART)
 else()
     pico_enable_stdio_uart(raiden_pico 0)
 endif()
+
+# Block on USB-CDC stdout instead of dropping bytes when the host is briefly not
+# reading. The SDK default (500ms) discards the tail of large outputs (HELP, and
+# SWD SNAPSHOT's ~55 lines) if a reader pauses. The write loop still bails
+# immediately on host disconnect, so this never hangs a headless board.
+target_compile_definitions(raiden_pico PRIVATE
+    PICO_STDIO_USB_STDOUT_TIMEOUT_US=10000000
+)
 
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(raiden_pico)

@@ -385,10 +385,20 @@ Raiden Pico includes built-in support for entering bootloader mode on common mic
 **`TARGET GLITCH PAYLOAD <voltage> [attempts]`** - Glitch with bootloader re-entry
 - Power glitch then re-enter bootloader to check for ISP code readout bypass
 
-**`TARGET GLITCH BYPASS [attempts] [count]`** - RDP1 flash dump via FPB redirect [STM32F1]
+**`TARGET GLITCH BYPASS [attempts] [count] [voltage_mv]`** - RDP1 flash dump via FPB redirect [STM32F1/F4]
 - Two-stage attack: POR glitch → FPB redirect → UART flash dump at 115200 baud
 - Default: 20 attempts, full flash size
+- `voltage_mv` (0–3300): use this glitch depth directly and **skip the sweep** —
+  establish it once with `TARGET GLITCH SWEEP` (its optimal threshold), then
+  re-apply it every run without re-sweeping. Omit (or 0) to auto-sweep as before.
 - See [STM32F1 RDP1 Bypass Workflow](#4-stm32f1-rdp1-bypass) below
+
+**`TARGET GLITCH SHADOWBYPASS [attempts] [count] [voltage_mv]`** - RDP1 shadow-load glitch + FPB dump [STM32]
+- Brownout→POR then a timed dip during recovery to corrupt the RDP option-byte
+  shadow load; sweeps dip offset × dwell.
+- `voltage_mv` (0–3300): ADC-gates the recovery dip to that depth (drop rail, poll
+  ADC0/GP26 until ≤ threshold, then dwell) instead of the legacy uncontrolled
+  fixed-time low pull. Get the value from `TARGET GLITCH SWEEP`.
 
 **`TARGET TIMEOUT [<ms>]`** - Get/set transparent bridge timeout
 - Default: 50ms
@@ -581,6 +591,16 @@ inspection, and read-only BAT32G135 option-byte decoding.
 - Reads DPIDR, CPUID, and STM32 debug ID code
 - Decodes ARM part number and STM32 device variant
 
+**`SWD SCAN`** - Enumerate the DAP (Access Ports + CoreSight ROM table)
+- Reads each Access Port's IDR, then walks each MEM-AP's CoreSight ROM table and
+  names the debug components (SCS, DWT, FPB/BPU, ITM, TPIU, ETM) by their debug
+  base address (plus raw part number).
+- SWD-only — JTAG is not required; it would only add boundary-scan / multi-TAP.
+- Enumerates only **CoreSight debug** blocks; application peripherals (USART/I2C/
+  GPIO) have no ID registers and don't appear — those come from the family memory map.
+- Works on a **locked (RDP1)** target: the debug topology reads even when flash/SRAM
+  MEM access is blocked (verified on STM32F401 at RDP0 and RDP1).
+
 **`SWD HALT`** / **`SWD RESUME`** - Halt/resume target core
 - Uses DHCSR debug register to control execution
 - Required before register reads or SRAM writes
@@ -726,6 +746,35 @@ Built-in UART control for GRBL-based XY positioning platforms (CNC routers, lase
 **`GRBL RESET`** - Soft reset GRBL
 - Sends Ctrl-X (0x18) to reset GRBL controller
 - Use to recover from error states
+
+#### External PSU Control (TENMA / Multicomp Pro 72-2540, Korad protocol)
+
+Control an external programmable bench supply over serial, for precise
+programmable target Vout/Iout and current limiting during voltage-sweep
+campaigns — beyond what the onboard GP10/11/12 switching can do.
+
+**`PSU VOLT <mV>`** - Set output voltage (0–30000 mV)
+**`PSU CURR <mA>`** - Set current limit (0–5000 mA)
+**`PSU ON` / `PSU OFF`** - Enable / disable the output
+**`PSU STATUS`** - Read back Vout / Iout, CV/CC mode, and output state
+**`PSU ID`** - Identify the PSU (connectivity check; sends `*IDN?`)
+**`PSU RELEASE`** - Return GP10/11 to the target power group
+
+- **UART:** UART1 routed to GP10 (TX) / GP11 (RX) at 9600 8N1, using the RP2350
+  alternate funcsel — the same on-the-fly UART-config switching used for
+  Target/GRBL.
+- **Wiring:** the 72-2540's DB9 is true RS-232 (±12 V), so a **MAX3232** (or
+  equivalent) transceiver is required between the DB9 and GP10/11. Alternatively
+  use the unit's USB port via a USB-serial adapter.
+- **Mutually exclusive with `TARGET POWER`:** GP10/11 are shared with the target
+  power group. A PSU command releases the power group and claims the pins; while
+  the PSU holds them, `TARGET POWER ON/OFF/CYCLE/INT/EXT` returns an error until
+  you run `PSU RELEASE`. Ensure `TARGET POWER OFF` before the first PSU command.
+- **Verified end-to-end on real hardware** (Pico → YL-97/MAX3232 → RS-232 DB9 →
+  72-2540): `PSU ID` returns the unit identity, `VOLT`/`CURR` set and read back,
+  `ON`/`OFF` drive the output with the correct STATUS decode, and the mutual-
+  exclusion guard fires. Wiring note: the RS-232 DB9 needs **pin-5 GND common**
+  to the converter.
 
 ## Typical Workflow
 
@@ -1018,6 +1067,19 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 5** - Target UART RX (bootloader/bypass, also PIO monitored for UART triggers)
 - **GPIO 15** - Target reset / nRST (active low)
 
+### Status LED (board-aware)
+
+The heartbeat LED uses the SDK's `PICO_DEFAULT_LED_PIN`, so it follows the board:
+
+- **Pico 2** (`BOARD=pico2`) - GP25 (onboard LED)
+- **Pico 2 W** (`BOARD=pico2_w`) - no GPIO LED. The onboard LED is on the CYW43
+  wireless chip, and GP25 is the CYW43 chip-select (WL_CS), so the firmware
+  **no-ops the LED** rather than driving GP25. All glitching functions are
+  unaffected; no wireless stack is pulled in.
+- **Olimex RP2350-XXL** (`BOARD=xxl`) - whatever LED pin the board header defines.
+
+Build for the W with `cmake -S . -B build -DBOARD=pico2_w`.
+
 ### ChipSHOUTER Connection
 
 > **GP0/GP1 have two possible owners, never both at once.** By default they are
@@ -1036,7 +1098,7 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 - **GPIO 8** - GRBL UART TX (UART1 alternate function)
 - **GPIO 9** - GRBL UART RX (UART1 alternate function)
 
-**Note**: GRBL uses UART1 which is shared with Target UART (GP4/GP5). Only one can be active at a time - commands auto-switch as needed.
+**Note**: GRBL uses UART1, shared with the Target UART (GP4/GP5). Only one pin-set is live at a time, but commands auto-switch in both directions: a Target/bootloader command after a GRBL command auto-reclaims UART1 to GP4/5 and prints `OK: UART1 reclaimed from GRBL for Target (GP4/5)`. No manual `TARGET SYNC` is needed after GRBL.
 
 **CNC3018 Woodpecker controller wiring** (offline controller 8-pin header):
 - Pico GND → controller pin 3 or 4 (GND)
@@ -1046,6 +1108,7 @@ See [examples/heatmap_example.html](examples/heatmap_example.html) for an intera
 ### STM32 Attack / RDP Bypass
 
 - **GPIO 10/11/12** - Target Power (ganged, **boot default OFF**, 12mA drive each) — *INTERNAL power mode*
+  - GP10/11 double as the **external PSU UART1** (via `PSU` commands, needs a MAX3232); mutually exclusive with the power group
 - **GPIO 13** - BOOT0 control
 - **GPIO 14** - BOOT1 control
 - **GPIO 15** - nRST (shared with Target Reset)
